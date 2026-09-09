@@ -63,7 +63,7 @@ All IDs are short, lowercase, and meant to be typed by humans and LLMs.
 | Thing | ID | Example | Notes |
 |---|---|---|---|
 | Collection | user- or agent-chosen slug | `neon-cats` | Unique globally. Rename allowed via a `rename` command that rewrites references. |
-| Column | slug, unique within collection | `flux-pro`, `gpt-image`, `flux-pro-hq` | Defaults to the model's short name. Two columns may point at the same model with different settings. |
+| Column | slug, unique within collection | `flux-pro`, `gpt-image`, `flux-pro-hq` | Defaults to the model's short name. Two columns may point at the same model with different settings or count. |
 | Row | `r` + per-collection counter, never reused | `r1`, `r7` | Stable across reordering. Gaps after deletes are fine. |
 | Cell | path `collection/row/column` | `neon-cats/r3/flux-pro` | Not stored; derived address for a (row, column) pair. |
 | Generation | random 6 chars | `q7m2kd` | One attempt to fill a cell. Also addressable as `neon-cats/r3/flux-pro#2` (2nd version of that cell). |
@@ -80,8 +80,8 @@ and the API accepts the readable path forms everywhere an ID is expected.
 ## 3. Domain model
 
 ```
-Collection ─┬─ columns[]  (Column: id, model, settings overrides, position)
-            ├─ rows[]     (Row: id, prompt, inputs[], settings, paused, position)
+Collection ─┬─ columns[]  (Column: id, model, settings overrides, count, position)
+            ├─ rows[]     (Row: id, prompt, inputs[] with roles, settings, paused, position)
             └─ defaults   (settings applied to every row unless overridden)
 
 Cell (row × column) ── generations[]  (history, newest = current)
@@ -97,7 +97,7 @@ Asset  (uploaded | generated) ── file on disk + thumbnail + dimensions + mim
   title: 'Neon cats',
   description?: string,
   status: 'live' | 'paused',        // paused = edit freely, nothing generates
-  defaults: CommonSettings,          // aspect ratio, count, seed, ...
+  defaults: CommonSettings,          // aspect ratio, seed, ...
   columns: Column[],
   rows: Row[],
   createdAt, updatedAt
@@ -106,8 +106,13 @@ Asset  (uploaded | generated) ── file on disk + thumbnail + dimensions + mim
 
 ### Column
 ```ts
-{ id: 'flux-pro', model: 'bfl/flux-pro-1.1', settings?: ModelSettings, position: number }
+{ id: 'flux-pro', model: 'bfl/flux-pro-1.1', settings?: ModelSettings, count: number, position: number }
 ```
+
+`count` is how many outputs each cell in the column asks for (default 1, capped
+by the model's `capabilities.count`). It lives on the column, not the row,
+because it is part of what the column *is*: a column asking for four samples
+is a different experiment from one asking for one.
 
 ### Row
 ```ts
@@ -115,7 +120,7 @@ Asset  (uploaded | generated) ── file on disk + thumbnail + dimensions + mim
   id: 'r3',
   prompt: string,
   negativePrompt?: string,
-  inputs: AssetId[],                 // reference images, in order
+  inputs: { asset: AssetId, role: string }[],  // in order; role is 'reference', 'init', 'mask', ...
   settings?: CommonSettings,         // overrides collection defaults
   paused: boolean,
   position: number,
@@ -123,10 +128,16 @@ Asset  (uploaded | generated) ── file on disk + thumbnail + dimensions + mim
 }
 ```
 
+Input roles are the small vocabulary models understand: `reference` (style or
+subject guidance), `init` (image-to-image source), `mask` (inpainting region).
+Each model declares which roles it accepts and how many images in total. A row
+whose inputs use a role the column's model does not accept is `unsupported`
+for that column (§4.1); the image is never passed under a different role.
+
 ### Settings
 Two disjoint bags, owned by different things:
 
-- **CommonSettings** (`aspectRatio`, `size`, `count`, `seed`, `outputFormat`):
+- **CommonSettings** (`aspectRatio`, `size`, `seed`, `outputFormat`):
   a small vocabulary every provider understands. Owned by the **row**;
   collection defaults fill gaps. Resolution: `collection.defaults` ← `row.settings`.
 - **ModelSettings** (`quality`, `style`, `guidance`, `steps`, ...):
@@ -150,7 +161,7 @@ becomes `unsupported` instead (§4.1).
   id: 'q7m2kd',
   collection: 'neon-cats', row: 'r3', column: 'flux-pro',
   version: 2,                        // ordinal within the cell
-  requestHash: 'sha256…',            // hash of `request` below
+  requestHash: 'sha256…',            // hash of the cell's *content*, see §4.1
   request: ResolvedRequest,          // full snapshot; reproducible later
   status: 'queued' | 'submitting' | 'running' | 'downloading'
         | 'succeeded' | 'failed' | 'cancelled' | 'unsupported' | 'needs_attention',
@@ -167,9 +178,12 @@ becomes `unsupported` instead (§4.1).
 ```
 
 `ResolvedRequest` is what the provider actually receives: model, prompt,
-negative prompt, input asset IDs, resolved settings. It is fully materialized,
-so a generation is reproducible and comparable without looking at the row it
-came from. Rows can change; generations never do.
+negative prompt, input asset IDs with roles, count, resolved settings with
+registry defaults filled in, the keys that were dropped as unsupported, and
+the registry version that did the resolving. It is fully materialized, so a
+generation is reproducible and comparable without looking at the row it came
+from. Rows can change; generations never do. Note that `requestHash` is *not*
+the hash of this snapshot; see §4.1 for why.
 
 ### Asset
 ```ts
@@ -197,12 +211,35 @@ API only edits collections; the engine keeps live collections filled in.
 ### 4.1 Desired state and reconciliation
 
 For every live collection, every non-paused row, and every column, the desired
-generation is identified by `requestHash = hash(resolve(collection, row, column))`.
+generation is identified by `requestHash = hash(content(collection, row, column))`.
+
+**The hash covers what the user wrote, not what the provider receives.**
+`content()` is:
+
+- the column's model ID, its `settings` as written, and its `count`;
+- the row's prompt, negative prompt, and inputs with roles;
+- the row's common settings after applying collection defaults, with keys the
+  model does not honor removed.
+
+Registry defaults, dropped-key records, the registry version, and anything
+else `resolve()` adds on the way to the provider are **not** hashed. They are
+recorded in the generation's `request` snapshot instead. The distinction is
+what makes the identity stable: upgrading the server or changing a model's
+default `steps` must never invalidate every cell, while any edit to the
+collection's own content must. Removing unhonored keys before hashing means
+changing a seed on a model that ignores seeds is also not an edit.
 
 A cell is **satisfied** when it has a generation with that hash in any status
 other than `cancelled`. Otherwise the reconciler inserts a new generation with
 that hash and a snapshot of the request: `queued` if the row is compatible
 with the column's model, `unsupported` if not (see below).
+
+Several generations can share one hash; they are samples of the same request.
+The hash is the identity of *what was asked*; the generation's `version`
+ordinal distinguishes the samples. Neither a nonce nor a timestamp goes into
+the hash. If it did, reverting a prompt after a regenerate would produce a
+hash that matches nothing and run again, which is exactly the waste the hash
+exists to avoid.
 
 The reconciler runs:
 - after any mutation to a collection, its rows, or its columns (debounced ~200ms per collection),
@@ -214,7 +251,10 @@ Consequences that fall out for free:
 - Edit a row → only that row's cells get new generations. Other rows are untouched.
 - Add a column → every row gets one new cell.
 - Revert an edit → the old hash already has a succeeded generation, so nothing
-  runs and that generation becomes current again. Version history is real history.
+  runs and the newest generation with that hash becomes current again. Version
+  history is real history.
+- Set a seed on a model that ignores seeds → no new generation, since the key
+  is removed before hashing.
 - Pause, edit ten things, resume → one reconcile pass, one wave of jobs.
 - Restart → reconcile picks up where it left off.
 - Provider changes (API keys, concurrency, even model default settings in the
@@ -231,8 +271,9 @@ accepts an idempotency key; a submission that times out without one becomes
 `needs_attention`, because it may have been accepted and charged.
 
 **Unsupported combinations make no request.** `resolve()` checks the row
-against the column model's capabilities: input image count, negative prompt,
-sizes and aspect ratios. An incompatible pair gets a generation in status
+against the column model's capabilities: input roles and count, negative
+prompt, sizes and aspect ratios, and the column's `count` against the model's
+maximum. An incompatible pair gets a generation in status
 `unsupported` with a specific reason in `error`, and no provider call. Other
 columns in the same row still run. Input images are never silently dropped
 and a setting the model cannot honor is never approximated. Editing the row
@@ -242,15 +283,22 @@ or column changes the hash, so the check simply runs again.
 a generation for the old hash is still in flight:
 - `queued`, not yet submitted: marked `cancelled` at once.
 - Submitted: the runner aborts its local wait via `AbortSignal` and calls the
-  adapter's `cancel()` if it has one. The generation is marked `cancelled`
-  when that confirms. A local abort is never treated as a remote cancel; if
-  the adapter has no cancel endpoint, the job is monitored to completion and
-  its output stored. It just is not current.
+  adapter's `cancel()` if it has one. `cancel()` answers `confirmed`,
+  `pending`, or `unsupported`. Only `confirmed` marks the generation
+  `cancelled`. `pending` keeps it monitored until the provider reports an
+  outcome; if completion wins the race the output is stored and the
+  generation `succeeded`. `unsupported`, or no `cancel()` at all, means the
+  job is monitored to completion and its output stored. A local abort is
+  never treated as a remote cancel. A superseded generation that completes
+  is real history; it just is not current.
 
 **"Give me another one"** is the one imperative: `cell regenerate` inserts a
 new generation with the same hash and `forced: true`. Useful for
-non-deterministic models. The current version of a cell is the newest
-non-cancelled generation whose hash matches the desired hash.
+non-deterministic models. With a seed set on a model that honors it, a
+regenerate legitimately returns the same image; a user who wants variety
+clears the seed. The current version of a cell is the newest non-cancelled
+generation whose hash matches the desired hash. Pinning an older version as
+current is deferred (§9) and would not touch the hash.
 
 ### 4.2 The runner
 
@@ -320,7 +368,7 @@ interface Provider {
   models: ModelSpec[];
   generate(req: ResolvedRequest, ctx: GenerateContext): Promise<GenerateResult>;
   resume?(providerRef: string, ctx: GenerateContext): Promise<GenerateResult>;
-  cancel?(providerRef: string): Promise<void>;
+  cancel?(providerRef: string): Promise<'confirmed' | 'pending' | 'unsupported'>;
 }
 
 interface ModelSpec {
@@ -328,7 +376,8 @@ interface ModelSpec {
   name: string;
   kind: 'image' | 'video';
   capabilities: {
-    inputImages: number;               // 0 = text-only
+    inputRoles: string[];              // [] = text-only; e.g. ['reference'], ['init', 'mask']
+    maxInputImages: number;
     negativePrompt: boolean;
     seed: boolean;
     count: number;                     // max per request
@@ -365,8 +414,14 @@ provider's attachment mechanism. Temporary provider upload handles are
 execution metadata, not part of the request snapshot.
 
 Adapters that poll do so with `ctx.sleep` and honor `signal`. A shared
-`http.ts` helper gives retry-with-backoff on 429/5xx and timeout handling so
-adapters stay short. Aggregators (fal, Replicate) are one adapter each with
+`http.ts` helper gives timeout handling and retry-with-backoff on 429/5xx,
+**but only for calls the adapter marks as safe to repeat**: polls, downloads,
+input uploads. The submission POST is never retried by the helper. An adapter
+opts a submission into retry only when it passes a provider idempotency key
+and knows the provider honors it; otherwise a failed or timed-out submission
+is classified by the adapter as *definitely not accepted* (retryable by the
+runner within its budget) or *ambiguous* (becomes `needs_attention`, §4.2).
+SDK-level automatic retries are disabled unless their safety is known. Aggregators (fal, Replicate) are one adapter each with
 many models in their registry; that is how we get Recraft, Ideogram, and
 friends cheaply.
 
@@ -411,18 +466,31 @@ asset.created                                   { id }
 Events carry IDs, not payloads. Consumers refetch what they need; that keeps
 the bus trivial and makes it impossible for a client to see a stale payload.
 
+Every event also carries a **cursor**: a per-collection counter that
+increments on each event, alongside a server boot ID. `collections get` and
+every mutation return the collection's current cursor. A client that holds a
+cursor can ask "has anything happened since?" without guessing, which is what
+`collection wait` below is built on. The cursor is in memory only; a cursor
+from a previous boot is treated as stale and any wait on it returns at once.
+
 Consumers:
 - **Reconciler** subscribes to collection/row/column events.
 - **Runner** subscribes to `generation.updated` (status `queued`) to wake up.
 - **SSE endpoint** forwards events to browsers, optionally filtered by collection.
   The UI invalidates the matching TanStack Query keys and refetches; a grid of
-  a few hundred cells refetches in one request.
+  a few hundred cells refetches in one request. On reconnect the UI simply
+  refetches; there is no replay log, since a refetch is the recovery.
 - **MCP** does not get a push channel by default (most agents cannot consume
-  one). Instead the command layer offers `collection wait`: block until the
-  collection has no queued/running generations, or until a change happens, or
-  a timeout elapses. An agent's loop becomes "edit → wait → look at results".
-  If a client supports MCP resource subscriptions we can map collection
-  resources to the same events later; nothing in the core changes.
+  one). Instead the command layer offers `collection wait { cursor, timeout }`:
+  return as soon as the collection's cursor is past the given one, or when the
+  timeout elapses. The response carries the new cursor and whether any
+  generations are still queued or in flight. Waiting on a cursor rather than
+  on "nothing is running" matters because of the reconcile debounce: right
+  after an edit, nothing is queued yet, and an idle check would return
+  immediately with stale results. An agent's loop is "mutate (get cursor) →
+  wait(cursor) → get, repeat while in flight". If a client supports MCP
+  resource subscriptions we can map collection resources to the same events
+  later; nothing in the core changes.
 
 ---
 
@@ -455,7 +523,7 @@ window for a normal-sized collection.
 
 Design rules for the command layer:
 - Accept readable addresses everywhere: `neon-cats/r3/flux-pro`, `neon-cats/r3/flux-pro#2`, plain asset IDs.
-- Mutations return the updated object; no separate refetch needed.
+- Mutations return the updated object and the collection's cursor; no separate refetch needed.
 - Bulk-friendly: `rows add` accepts an array so an agent can create ten prompts in one call.
 - Nothing about generation is imperative except `regenerate`, `retry`, `cancel`. Adding a row to a live collection is how you generate.
 
@@ -515,6 +583,10 @@ present. The model registry is code; adding a model is adding a `ModelSpec`.
 file and the controllable mock provider: duplicate commands; row-only and
 column-only invalidation; pause, edit several things, resume; out-of-order
 completions; edits during active runs; partial row failure; cancellation
-races; crash between `submitting` and `providerRef`; restart during polling;
-restart during download; pinned inputs surviving regeneration of their source
-cell; SSE reconnect after missed events.
+races including completion beating a `pending` cancel; crash between
+`submitting` and `providerRef`; restart during polling; restart during
+download; pinned inputs surviving regeneration of their source cell; SSE
+reconnect after missed events; revert after regenerate finds the old hash
+with no new run; registry default change causes no new runs; `wait` on a
+cursor taken before an edit returns only after the reconcile pass; ambiguous
+submission timeout lands in `needs_attention` and is never resubmitted.
