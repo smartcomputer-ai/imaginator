@@ -1,143 +1,486 @@
-# Imaginator architecture proposal
+# Imaginator architecture
 
-Imaginator is a personal workspace for comparing image generation models. A collection is a grid: rows describe inputs, columns describe model configurations, and each intersection has a history of generation runs. The backend owns this state and generates results even when no browser is open.
+This is the authoritative design for Imaginator's first implementation. The
+repository currently contains design documents, not application code.
 
-This document proposes the first implementation. It assumes one user, one machine holding the data, and generation performed by external providers. Videos can use the same run and asset model later. No application code has been implemented yet.
+Imaginator is a personal workspace for comparing image generation models. A
+**collection** is a grid: rows describe inputs, columns describe model
+configurations, and each cell has a history of generation runs. Editing a live
+collection requests results automatically. The backend owns execution and keeps
+working when no browser is open. The UI and an MCP client use the same API.
 
-**Recommended stack.** Use TypeScript throughout: React, Vite, shadcn/ui, and Tailwind for the browser; Node.js and Fastify for the server; Zod for shared command and result schemas; TanStack Query for browser server-state caching. Use SQLite with Drizzle and `better-sqlite3` for structured data, and ordinary local files for asset bytes. Use one server process, including its scheduler, with one small database worker thread.
+The first version assumes one user, one machine holding the data, and external
+generation providers. It uses one server process, SQLite, and local asset files.
 
-My reason for choosing TypeScript is shared types, validation, tooling, and language across the UI, application service, and provider adapters. Python with FastAPI and asyncio would also handle the network concurrency: the decision is about reducing development overhead, not a claimed concurrency advantage. Python would become more attractive if local inference or substantial Python image-processing code became central. [FastAPI documents its async model](https://fastapi.tiangolo.com/async/), and [Fastify documents its TypeScript support](https://fastify.dev/docs/latest/Reference/TypeScript/).
+## 1. Stack and module boundaries
 
-The UI can start as an ordinary client-rendered application. [shadcn/ui supports Vite](https://ui.shadcn.com/docs/installation/vite). The same backend serves the built UI, commands, queries, notifications, and assets; development can use Vite's proxy. HTTP and future MCP handlers are thin adapters over the same application service.
+| Layer | Choice | Purpose |
+| --- | --- | --- |
+| Language | TypeScript, pnpm workspaces | Share contracts, validation, and tooling across the server, UI, and MCP. |
+| HTTP | Node.js, Hono, Zod | Serve commands, queries, notifications, assets, and the built UI. |
+| UI | Vite, React, Tailwind, shadcn/ui | Collection grid, editing, and result inspection. |
+| Browser data | TanStack Query and server-sent events (SSE) | Cache snapshots and refetch after committed changes. |
+| Metadata | SQLite, Drizzle, `better-sqlite3` | Store configuration, revisions, runs, assets, and changes. |
+| Media | Local filesystem and sharp | Preserve originals; read metadata and create thumbnails. |
+| Execution | In-process async runner over the `runs` table | Durable work without Redis or a separate worker deployment. |
+| MCP | TypeScript MCP SDK | Thin tools over the shared command/query registry. |
+
+TypeScript reduces development overhead across these components. Python with
+asyncio could also handle the network concurrency; the language choice does not
+depend on a concurrency advantage.
+
+```text
+imaginator/
+  packages/
+    core/       # domain contracts, Zod schemas, IDs, pure request resolution
+    server/     # commands/queries, repositories, runner, provider adapters,
+                # asset store, HTTP/SSE, MCP
+    web/        # React application
+  data/         # runtime data, gitignored
+    imaginator.sqlite
+    assets/
+    tmp/
+```
+
+`core` has no database, filesystem, or network I/O. Provider-specific resolution
+functions remain pure even when colocated with server adapters. Provider secrets
+and execution code stay on the server. These are module boundaries within one
+deployment.
 
 ```mermaid
 flowchart TD
-    UI[React collection grid] --> Core[Application service: commands and queries]
-    Agent[Future MCP adapter] --> Core
-    Core --> DB[(SQLite: configuration, revisions, runs, changes)]
-    DB --> Scheduler[In-process scheduler]
-    Scheduler --> Providers[Provider adapters]
+    UI[React collection grid] --> API[Commands and queries]
+    MCP[MCP transport] --> API
+    API --> DB[(SQLite: revisions, runs, assets, changes)]
+    Runner[Async runner] --> DB
+    Runner --> Providers[Provider adapters]
     Providers --> Remote[Remote generation APIs]
-    Scheduler --> Files[Local asset files]
-    Scheduler --> DB
-    DB --> Updates[Committed change notifications]
-    Updates --> UI
+    Runner --> Assets[Local asset store]
+    DB --> SSE[Committed change notifications]
+    SSE --> UI
 ```
 
-**The domain model.** Separate editable configuration, immutable configuration revisions, execution state, and immutable assets. This makes history and asynchronous completion straightforward.
+## 2. Domain model
 
-| Concept | Meaning and essential data |
+Keep editable configuration, immutable revisions, execution state, and immutable
+assets separate.
+
+| Concept | Essential data and meaning |
 | --- | --- |
-| Collection | Stable slug, display name, `live` or `paused`, and ordered rows and columns. |
-| Row | Stable collection-local ID, display label, pause flag, and current revision number. |
-| Row revision | Immutable prompt, ordered input-asset references, and common generation controls. |
-| Column | Stable collection-local ID, display label, and current revision number. Represents a model configuration, so the same model can occupy several columns with different settings. |
-| Column revision | Immutable provider key, model identifier/version where available, and model-specific settings. |
-| Cell | Logical `(collection, row, column)` address. Its current state and history are derived from runs; it does not initially need a separate table. |
-| Generation run | A request for one cell using particular row and column revisions. Includes an immutable resolved specification, mutable execution status, ordered outputs, timings, and errors. |
-| Asset | Immutable uploaded or generated media, with a global short ID, file location, media metadata, checksum, and provenance. |
+| Collection | Immutable slug, editable title/description, live/paused status, ordered rows and columns, edit version. |
+| Row | Stable collection-local ID, label/notes, position, pause flag, current revision, edit version. |
+| Row revision | Immutable prompt, ordered input-asset references with roles, and common generation controls. |
+| Column | Stable collection-local ID, label, position, current revision, edit version. |
+| Column revision | Immutable provider/model reference, model version where available, and model-specific settings. |
+| Cell | Logical `(collection, row, column)` address; current state and history come from runs. No cell table initially. |
+| Run | One request for a cell at specific row/column revisions; immutable resolved request and mutable execution state. |
+| Asset | Immutable uploaded or generated media with metadata, checksum, and provenance. |
 
-A row revision groups the inputs used across the row. Each cell run records its own execution and outputs. This gives both useful kinds of history without versioning an entire collection whenever one prompt changes.
+A column represents a model configuration. Two columns can use the same model
+with different settings. A row revision groups the inputs compared across those
+columns without creating a revision of the whole collection.
 
-For example, `portraits/r3` revision 4 paired with column `model-a` revision 2 requests one run. Clicking “Generate again” creates another run against those same revisions. Editing the prompt creates row revision 5 and requests a new run in every compatible column.
+A run may produce several assets. Preserve their order; the grid shows the first
+image and an output count. Generated assets identify their producing run and
+output position. Following the run's input references gives their lineage.
 
-A run can return multiple assets; the grid shows its first image and an output count, and the viewer shows all of them. Uploads and generated images use the same asset system. A generated asset points back to its producing run and output position, and the run's input references provide its lineage.
+### Identifiers
 
-**IDs.** Use readable public identifiers directly as database keys, with compound keys for collection-local objects.
+Use readable public identifiers as database keys, with compound keys for local
+objects.
 
 | Object | Example | Rule |
 | --- | --- | --- |
-| Collection | `portraits` | User-selected slug, immutable after creation; display name remains editable. |
-| Row | `portraits/r3` | Increasing local number; never recycle deleted numbers. |
-| Column | `portraits/model-a` | Stable local slug, independent of its editable label. |
-| Cell | `portraits/r3/model-a` | Derived from its row and column. |
-| Image | `img_k7m4p2qx` | Global prefix plus eight random readable characters. |
-| Generation | `gen_v6t2n8ca` | Global prefix plus eight random readable characters. |
-| Revision | `4` | Increasing number within its parent object. |
+| Collection | `portraits` | User-selected slug; immutable after creation. Rename changes the display title. |
+| Row | `portraits/r3` | Increasing local number; never reuse an archived row's number. |
+| Column | `portraits/model-a` | Local slug independent of the editable label; retain it when archived. |
+| Cell | `portraits/r3/model-a` | Derived address. |
+| Image asset | `img_k7m4p2qx` | Global prefix plus eight random readable characters. |
+| Run | `gen_v6t2n8ca` | Global prefix plus eight random readable characters. |
+| Revision | `4` | Increasing number within its row or column. |
 
-Use a lowercase alphabet that avoids ambiguous characters, enforce uniqueness in SQLite, and retry an insert on collision. These IDs are handles, not access-control secrets. Internal checksums and provider job IDs need not be short. A future video can use `vid_…` without changing asset references elsewhere.
+Random IDs use a lowercase alphabet without ambiguous characters. Enforce
+uniqueness in SQLite and retry insertion on collision. IDs are handles, not
+access-control secrets. A future video asset can use `vid_…`.
 
-**Inputs and model settings.** Start with a small common input vocabulary: prompt text, ordered image references with explicit roles, optional aspect ratio, and optional seed. Put model-specific controls such as quality, inference steps, and editing strength in the column's validated settings.
+## 3. Inputs, settings, and request resolution
 
-The row owns common controls; column settings cannot silently override those same fields. Model defaults fill genuinely unspecified values during request preparation. Materialize application-controlled defaults in the resolved run specification. If the provider has an undisclosed default, record that the field was omitted instead of inventing its value. Store effective values returned by the provider separately.
+Start with a small common vocabulary: prompt, ordered image references with
+explicit roles, optional aspect ratio, and optional seed. The row owns these
+controls. Model-specific controls such as quality, steps, output count, and
+editing strength belong to the column's validated settings. Columns cannot
+silently override row controls. There are no collection-level generation
+defaults or reusable presets in the first version; duplicate a column to reuse
+its configuration.
 
-Each adapter declares model capabilities and validates the combination: accepted image roles/counts, allowed dimensions or ratios, supported controls, and output media kind. An incompatible cell shows a specific `unsupported` reason and incurs no provider request. Compatible cells in the same row still run. Do not silently discard an input image or approximate a setting that the model cannot honor.
+The following TypeScript sketches describe the contracts; Zod schemas define
+their runtime validation. `JsonObject` denotes serializable JSON object data.
 
-These are comparisons of the same input intent, not a guarantee of identical model behavior. The same numerical seed does not establish equivalent randomness across models. The run inspector exposes the resolved provider settings and reported model version so differences remain visible.
+```ts
+interface RowRevision {
+  revision: number;
+  prompt: string;
+  inputs: Array<{ assetId: string; role: string }>;
+  controls: { aspectRatio?: string; seed?: number };
+}
 
-An input points to a specific asset, for example `img_k7m4p2qx`, including when selected from another cell. Choosing “Use as input” pins that image. Regenerating the source cell does not replace the input or trigger downstream runs. This supports reuse within or across collections without introducing dependency scheduling, cycles, or cascading generation. Dynamic references such as “always use the latest output of this cell” can be a separate later feature.
+interface ColumnRevision {
+  revision: number;
+  provider: string;
+  model: string;
+  modelVersion?: string;
+  settings: JsonObject;
+}
 
-**Regeneration rules.** Configuration updates, generation intents, and their change records commit together in a SQLite transaction. An intent is simply a queued run, not another queue product or a second job entity. Provider requests happen only after that transaction commits.
+interface ResolvedRequest {
+  provider: string;
+  model: string;
+  modelVersion?: string;
+  adapterVersion: string;
+  prompt: string;
+  inputs: Array<{ assetId: string; role: string }>;
+  controls: RowRevision['controls'];
+  settings: JsonObject;
+  payload: JsonObject;              // provider payload with local asset references
+  omittedProviderDefaults: string[];
+}
 
-| Change | Work requested |
-| --- | --- |
-| Add a row | One run for each compatible column. |
-| Change a row's prompt, input assets, or generation controls | New row revision; runs across that row. |
-| Add a column | One run for each compatible row. |
-| Change a column's model or generation settings | New column revision; runs down that column. |
-| Change a title, label, or ordering | No generation. |
-| Change provider credentials, concurrency, or transport timeout | No generation. |
-| Change a reusable preset | Existing columns keep their copied settings; applying the preset is an explicit column edit. |
-| Generate again | New run for the selected cell, row, or collection, even if inputs are identical. |
-
-Provider administration is separate from experiment configuration. Credentials and scheduling limits never form part of the generation revision. A change that affects output semantics belongs in a column revision. Prefer duplicating a column to compare two settings side by side.
-
-The UI keeps unsaved text locally and autosaves after a short quiet interval. The backend also gives automatic runs a brief persisted `not_before` delay, initially about one second. Further committed edits supersede queued runs for older revisions. This is coalescing, not a guarantee that an already submitted request can be undone. A no-op save creates no revision; restoring older content creates a new revision and requests generation normally.
-
-Use a database uniqueness rule for the automatic run at `(collection, row, row revision, column, column revision)`. Retrying a command or waking the scheduler twice cannot create two automatic runs for the same combination. Manual reruns are distinguished from automatic runs and receive their own IDs; accept a client request key so retransmitting a manual command also remains idempotent.
-
-Collection and row pause are dispatch gates. New collections and rows default to live. An empty or structurally incomplete row can be saved as a draft but cannot dispatch. A valid row is eligible when both its row and collection are live. Saving while paused still records revisions and intents, and resume dispatches only the latest eligible intents. Pause blocks automatic and manual dispatch alike; the UI requires resuming before a manual run can start.
-
-Pause prevents new submission claims. A request already claimed as `submitting` may still reach the provider; submitted requests continue to be monitored and their outputs are downloaded, even after pause or a newer edit. Explicit cancellation is a separate operation, performed where the provider supports it. Locally cancelled or failed work is not silently recreated by the scheduler; another generation requires an explicit rerun or a new configuration revision.
-
-**History and current results.** The current cell view is selected by configuration revisions and request order, never completion time. Store a monotonic run sequence so selection does not depend on timestamps or random IDs.
-
-The newest requested run for the current row/column revisions determines current status. If it is still running or has failed, the previous successful image may remain visible with a clear status overlay and its revision/run label. It must not look like the new result. A successful older request that finishes late is added to history and cannot replace the current selection.
-
-Keep execution status separate from relevance: an older run can succeed while no longer being current. A queued run made obsolete before submission can terminate as `superseded`; a submitted run retains its real provider lifecycle.
-
-The cell viewer shows all previous runs, their prompt/settings snapshots, outputs, errors, and timestamps. At row level, selecting a revision shows the corresponding inputs and results across columns. Selecting history for inspection does not change the active configuration. “Restore this revision” is an explicit edit.
-
-**Durable execution inside one process.** Persist run lifecycle and recovery fields in SQLite, while the Node process performs asynchronous network work. There is no separate Redis service or queue worker deployment in the first version.
-
-The normal lifecycle is:
-
-```text
-queued → submitting → waiting for provider → downloading → succeeded
-                    ↘ immediate result → downloading → succeeded
+type Resolution =
+  | { ok: true; request: ResolvedRequest }
+  | { ok: false; code: string; message: string };
 ```
 
-Errors may schedule a retry of the current safe step or end in `failed`. Cancellation can end in `cancelled`; an ambiguous submission can end in `needs_attention`. Persist the remote job ID/resume data, next action time, request idempotency key where supported, retry counters, deadlines, and structured errors. Maintain a small attempt log so network retries do not look like new experimental samples.
+`resolve(rowRevision, columnRevision)` is deterministic and has no network side
+effects. Each model declares capabilities and validates accepted image
+roles/counts, dimensions or ratios, controls, and output media kind. An
+incompatible cell shows a specific `unsupported` reason and makes no provider
+request. Compatible cells in the same row still run. Do not discard input images,
+drop explicitly requested controls, or approximate unsupported settings.
 
-The scheduler checks pause/current-revision eligibility and claims a submission in the same transaction, then dispatches through the appropriate adapter. It claims other due lifecycle steps without those dispatch gates so paused or historical jobs can still finish. Use one active scheduler per data directory. It owns an in-memory set of executing steps; recover their durable states at startup. Multi-process leases and distributed locking are deferred until there is a concrete need for multiple schedulers.
+Application-controlled defaults fill unspecified values and are materialized in
+the resolved request before queueing. Record undisclosed provider defaults as
+omissions; store effective values returned by the provider separately. Temporary
+uploads replace local asset references only during execution, with upload handles
+saved in checkpoints. Credentials never enter the request snapshot.
 
-Track three separate limits: total outstanding provider generations, outstanding generations per provider account, and simultaneous network operations. An accepted remote job occupies a generation slot until remote completion or confirmed cancellation, including time between polls. Submission rate limits and poll budgets are separate from those slot limits. Downloads get a bounded pool of their own. Choose conservative configurable defaults and honor provider retry delays.
+The stored request remains fixed even if the registry or adapter changes. A
+deployment does not create runs or rewrite queued requests. If an adapter can no
+longer execute a stored request faithfully, surface an actionable error. New runs
+record the resolver/adapter version and defaults used for them. Snapshots make
+experiments inspectable; they do not promise identical output from an external
+model or comparable randomness from the same seed across models.
 
-For polling, store `next_action_at`, perform one asynchronous status request when due, and schedule the next action with backoff and jitter. A timer wakes the scheduler for the next due item. There is no busy loop or dedicated thread per remote job. Allocate work fairly across live collections so one large grid cannot monopolize all slots.
+**Input reuse pins an asset.** “Use as input” stores a specific asset ID, including
+when the image came from another collection. Regenerating its source cell neither
+replaces the input nor triggers downstream runs. Dynamic references to a cell's
+latest output are deferred.
 
-Async and direct-response providers fit the same lifecycle. Replicate documents both [asynchronous job handles and synchronous responses](https://replicate.com/docs/topics/predictions/create-a-prediction/); fal exposes an [asynchronous queue](https://fal.ai/docs/documentation/model-apis/inference/queue). These support using an explicit submit/poll boundary rather than depending entirely on SDK convenience methods that wait for completion internally.
+## 4. Revisions and generation rules
 
-Recovery behavior must distinguish where a failure occurred:
+Configuration changes, their queued runs, and their change records commit in one
+SQLite transaction. A queued run is the generation intent; there is no separate
+job entity. Provider requests begin only after commit.
+
+| Operation | Result |
+| --- | --- |
+| Add a row | Request one automatic run per compatible column. |
+| Edit a row's prompt, assets, or controls | Create a row revision and request runs across that row. |
+| Add a column | Request one automatic run per compatible row. |
+| Edit a column's model/settings | Create a column revision and request runs down that column. |
+| Change a title, label, notes, or ordering | Update metadata; request no runs. |
+| Change credentials, concurrency, or transport timeout | Update administration; request no runs. |
+| Duplicate a column | Copy its configuration into an independent column and request runs there. |
+| Duplicate a collection | Copy current configuration and pinned inputs into a paused collection; copy no run history. |
+| Generate again | Request a new manual run for each selected cell, even with identical inputs. |
+| Restore an older revision | Copy its content into a new revision and request runs for the affected row or column. |
+
+A save with no semantic change creates no revision or run. Restoring content that
+already matches the active configuration is also a no-op. Otherwise, restoration
+generates a fresh sample; it does not automatically reuse a previous result.
+Inspecting history is read-only. Request hashes may help diagnostics later, but
+do not determine whether a cell needs work or whether an old run becomes current.
+
+### Coalescing and idempotency
+
+The UI keeps a local draft and autosaves after a short quiet interval, with
+blur/Enter also committing edits. Automatic runs have a persisted `not_before`
+delay, initially about one second. Further committed edits mark queued runs for
+obsolete revisions `superseded`. Once a run is claimed for submission, it follows
+the execution rules in section 6.
+
+Enforce a partial unique constraint for automatic runs on:
+
+```text
+(collection, row, row_revision, column, column_revision)
+WHERE trigger = 'automatic'
+```
+
+Keep this uniqueness across every run status. A failed, cancelled, or superseded
+run is not a missing run that the scheduler should recreate.
+
+All mutations require a client request key. Persist the command result with the
+mutation so retransmits return the original IDs, including for add, duplicate,
+batch, and manual generation commands. Look up an existing receipt before
+checking edit versions. Reusing a key with different input is an error. This is
+separate from provider idempotency: preventing duplicate local runs does not
+prove a remote API accepted a request only once.
+
+An atomic batch applies row/column edits and computes runs for the final state.
+It lets an external client build a grid without generating intermediate
+combinations.
+
+### Pause, drafts, and archive
+
+Collection and row pause are dispatch gates. New collections and rows default
+to live. An empty or structurally incomplete row can be saved as a draft, but
+cannot dispatch. Valid edits while paused still record revisions and queued
+runs; resume dispatches only the latest eligible runs. A duplicated collection
+can therefore have queued work while paused without making provider calls.
+
+Pause blocks automatic and manual dispatch. Manual generation requires the
+selected rows and collection to be live; otherwise the command returns a clear
+paused error. Archive also blocks dispatch and supersedes queued work for the
+archived objects. Submitted work continues into history.
+
+Pause prevents new submission claims. A run already claimed as `submitting` may
+still reach the provider. Neither pause nor a newer edit cancels that work.
+
+## 5. History and current cell state
+
+Persist an increasing `sequence` within each cell, allocated transactionally for
+every requested run. Current status comes from the highest sequence for the
+active row and column revisions, never completion time or a random ID.
+
+If that run is pending, failed, or cancelled, the viewer may keep a previous
+successful image visible with its own revision/run label and a current-status
+overlay. An older run finishing late enters history without replacing the
+current selection. Execution status and relevance are independent: an obsolete
+run can still succeed.
+
+The cell viewer shows every run's request snapshot, ordered outputs, errors,
+timings, and reported provider metadata. Row history filters runs by the selected
+row revision and shows the column revision used by each run. It does not imply
+that the whole collection had a single shared revision. Inspecting history does
+not change the active configuration; restoring it is the explicit edit described
+above.
+
+## 6. Durable execution
+
+### Run record and lifecycle
+
+```ts
+type RunStatus =
+  | 'queued' | 'submitting' | 'waiting' | 'downloading'
+  | 'succeeded' | 'failed' | 'cancelled' | 'superseded'
+  | 'needs_attention';
+
+interface Run {
+  id: string;
+  cell: { collection: string; row: string; column: string };
+  rowRevision: number;
+  columnRevision: number;
+  sequence: number;
+  trigger: 'automatic' | 'manual';
+  request: ResolvedRequest;            // immutable after queueing
+  status: RunStatus;
+  notBefore: string;
+  checkpoint?: JsonObject;            // server-only, serializable resume state
+  providerRequestKey?: string;
+  deadline?: string;                  // assigned at admission, preserved on recovery
+  retryCounts: Record<string, number>;
+  error?: { code: string; message: string; operation: string };
+  outputs: string[];                  // ordered asset IDs, backed by output links
+  timing: { queuedAt: string; startedAt?: string; finishedAt?: string };
+}
+```
+
+Also persist output retrieval/staging descriptors, cancellation requests, capacity
+reservations, and a small attempt log. Record cost and effective provider values
+when available. Checkpoints and retrieval URLs are execution data, distinct from
+the permanent request snapshot and public run view.
+
+```text
+queued → submitting → waiting → downloading → succeeded
+                    ↘ direct result → downloading → succeeded
+
+queued → superseded                  obsolete before submission
+queued → cancelled                   explicitly cancelled before submission
+active → failed                      known failure with no uncertain remote work
+active → cancelled                   remote cancellation confirmed
+active → needs_attention             submission or recovery cannot be resolved
+```
+
+Here `active` means `submitting`, `waiting`, or `downloading`. These are persisted
+phases within one run, not separate scheduler jobs. Safe network retries append
+attempts to that run. An explicit rerun creates a new run and sequence. Failed or
+cancelled runs never automatically create replacements.
+
+### Runner and concurrency
+
+Keep exactly one runner per data directory, protected by a process ownership
+lock, and an in-memory map of active tasks. Refuse to start a second runner for
+that directory. The runner:
+
+1. Selects the oldest due queued run whose provider account has capacity.
+2. Rechecks current revisions, draft/unsupported state, pause, and archive gates;
+   claims the eligible run as `submitting` and reserves global/provider capacity
+   in the same transaction.
+3. Starts an async task with error handling and cleanup.
+4. Wakes when work is queued, capacity changes, a collection/row resumes, or the
+   next eligible queued run's `not_before` expires.
+
+Use two configurable limits: a global cap and a cap per provider account. A run
+holds both slots through input preparation, generation, polling, and persistence
+of its original outputs. Sleeping between polls does not release capacity.
+Persist reservation state with the claim and subsequent transitions to rebuild
+these counts after restart. An uncertain remote run retains its reservation until
+resolved or explicitly abandoned.
+
+Use simple queue order among eligible runs. Process outputs sequentially within
+a run initially. Provider polling lives inside async `generate()` or `resume()`
+calls, using abortable sleep, backoff, and jitter. Poll timers stay in memory;
+restart chooses a fresh delay while preserving deadlines and retry counts. The
+queued-run `not_before` is only for edit coalescing. Separate download pools,
+per-collection fairness, and distributed leases are deferred.
+
+### Recovery and retries
 
 | Persisted situation | Recovery |
 | --- | --- |
-| Queued, never submitted | Recheck current revisions and pause state, then submit when eligible. |
-| Remote job ID saved | Resume polling that same job. |
-| Provider succeeded, local download incomplete | Retry acquiring the existing outputs; do not regenerate. |
-| Submission may have succeeded, but no durable remote ID | Recover through provider idempotency or lookup if available; otherwise mark `needs_attention`. |
-| Failed validation, unsupported input, or rejected credentials | Surface an actionable error; do not retry repeatedly. |
+| Queued, never submitted | Recheck eligibility and submit when due and capacity is available. |
+| Remote handle saved and adapter supports resume | Resume the same job. Do not call `generate()` again. |
+| Interrupted remote job cannot be resumed | Mark `needs_attention` and retain its handle for inspection. |
+| Provider succeeded, local output acquisition incomplete | Retry downloading or finalizing those outputs, without generation. |
+| Submission may have succeeded, but no durable remote handle exists | Recover using provider idempotency or lookup if supported; otherwise mark `needs_attention`. |
+| Submission is known not to have been accepted | Retry only if the classified error permits it, within the original budget. |
+| Invalid request or rejected credentials | Show an actionable error; do not repeat automatically. |
 
-There is no general exactly-once guarantee across a local database and an external paid API. Persist `submitting` before the request, and persist the returned handle promptly, but acknowledge the crash/timeout window between provider acceptance and local persistence. For a provider with no idempotency or lookup, automatically repeating an ambiguous submission risks an extra charge. Keep its capacity reservation until resolved or explicitly abandoned. The UI can offer an explicit new run.
+There is no general exactly-once guarantee across SQLite and a paid remote API.
+Persist `submitting` before the request and save the remote handle immediately
+after acceptance. A crash or timeout can still occur between acceptance and
+local persistence. Blindly repeating that submission can create an extra charge.
 
-Do not resubmit because a poll failed, or because a deadline elapsed while the provider might still be running. Continue bounded recovery/monitoring or surface uncertainty. SDK-internal retries of generation creation must also be disabled or verified to use safe provider idempotency. Download failure after remote output expiry is a retrieval failure requiring an explicit rerun, not permission to generate silently.
+Retry only operations known to be safe: polling, downloading, a confirmed
+unaccepted submission, or submission protected by the provider's actual
+idempotency contract. A generic HTTP helper must not retry every generation POST
+on a timeout or 5xx. Disable SDK submission retries unless their safety is known.
+Persist bounded retry counts and honor provider retry delays.
 
-On shutdown, stop new submissions and persist recoverable progress. On startup, resume known jobs, resolve interrupted submission states, supersede obsolete queued work, and rebuild concurrency counts before admitting more work. These properties are the main reason to persist the queue from the first version.
+A failed poll or elapsed deadline is not evidence that the remote job stopped.
+Continue bounded recovery or surface `needs_attention`; never resubmit it as a
+new generation. Expired output URLs are a retrieval failure and require an
+explicit rerun if the output cannot be recovered.
 
-**Asynchrony and database access.** Use async provider SDK operations or `fetch`, streamed downloads, asynchronous filesystem APIs, and abortable timeouts. Limit large image work and thumbnail creation outside the JavaScript event loop. A function being declared `async` does not make blocking work inside it nonblocking; [Node's event-loop guidance](https://nodejs.org/learn/asynchronous-work/dont-block-the-event-loop) explains that distinction.
+The resolve operation for `needs_attention` can resume a recovered job, record a
+verified provider outcome, or explicitly abandon tracking and release its
+reservation. Abandoning does not claim that the provider cancelled the job.
+Requesting a new sample remains a separate manual run.
 
-`better-sqlite3` uses a synchronous API. To preserve the requested responsiveness, put its connection and Drizzle access in one dedicated database worker thread with a small typed, promise-based repository interface. Send whole transactional operations to that worker, not one message per SQL statement, and never hold a transaction open across a provider request. This remains one operating-system process. The worker isolates a synchronous library; provider I/O stays on normal async APIs. [better-sqlite3 documents its synchronous interface and worker support](https://github.com/WiseLibs/better-sqlite3), and [Drizzle supports the driver](https://orm.drizzle.team/docs/sqlite/get-started-sqlite).
+### Cancellation and process lifecycle
 
-**Persistence and assets.** SQLite stores collections, rows and revisions, columns and revisions, runs and attempt records, assets and run-output links, input references, and a compact change log. Use foreign keys, migrations, indexes for due work and cell history, and WAL mode. SQLite permits concurrent readers with a writer in WAL mode but still serializes writes; keep transactions short and the database on local disk. [SQLite WAL documentation](https://www.sqlite.org/wal.html).
+Cancel queued work locally. For submitted work, record the cancellation request
+and use the adapter's cancel operation when available. Keep monitoring until the
+provider confirms an outcome. A cancellation request, local `AbortSignal`, or
+network disconnect does not establish remote cancellation. If completion wins
+the race, save the output and record success. Unsupported cancellation leaves
+the job monitored and explains that result to the client.
+
+On shutdown, stop admission and abort local waits/I/O while preserving recovery
+checkpoints. Do not request remote cancellation just because the server stops.
+On startup, rebuild reservations before admitting new runs, recover unfinished
+work, and supersede obsolete queued runs. Recovery continues for paused,
+archived, and historical work. Already admitted jobs remain monitored if caps
+were lowered; their reservations block new admission until capacity is available.
+
+## 7. Provider adapters
+
+Implement one adapter per provider, with a model registry and model-specific
+schemas. Aggregators can expose many models through one adapter. Use an official
+SDK when it exposes the required lifecycle; otherwise wrap HTTP directly.
+
+```ts
+interface ModelSpec {
+  id: string;
+  name: string;
+  kind: 'image' | 'video';
+  capabilities: {
+    inputRoles: string[];
+    maxInputImages: number;
+    seed: boolean;
+    aspectRatios?: string[];
+    sizes?: string[];
+    maxOutputs: number;
+  };
+  settingsSchema: ZodType;
+}
+
+interface Provider {
+  id: string;
+  models: ModelSpec[];
+  resolve(row: RowRevision, column: ColumnRevision): Resolution;
+  generate(request: ResolvedRequest, ctx: GenerateContext): Promise<GenerateResult>;
+  resume?(
+    request: ResolvedRequest, checkpoint: JsonObject, ctx: GenerateContext
+  ): Promise<GenerateResult>;
+  cancel?(checkpoint: JsonObject): Promise<'confirmed' | 'pending' | 'unsupported'>;
+}
+
+interface GenerateContext {
+  signal: AbortSignal;
+  deadline: string;
+  providerRequestKey?: string;
+  retryCounts: Readonly<Record<string, number>>;
+  asset(id: string): Promise<{ path: string; mime: string }>;
+  checkpoint(state: JsonObject): void; // durable commit before returning
+  recordAttempt(attempt: JsonObject): void; // persists operation and retry count
+  sleep(ms: number): Promise<void>;
+  log(message: string): void;
+}
+
+interface GenerateResult {
+  outputs: Array<
+    | { url: string; mime?: string }
+    | { bytes: Uint8Array; mime: string }
+  >;
+  cost?: { amount: number; currency: string };
+  providerMeta?: JsonObject;
+}
+```
+
+`generate()` handles a direct response or submission plus polling, and resolves
+when the provider's outputs are available. Immediately after acceptance, save the
+remote handle and required resume metadata through `checkpoint()` before polling
+or sleeping. This callback commits synchronously with the selected SQLite driver.
+Upload handles and other preparation progress can also be checkpointed; a
+checkpoint alone does not imply generation was accepted.
+
+`resume()` continues the same remote job and returns the same result shape. It
+must never create a replacement. Providers with recoverable handles should
+implement it; providers without recovery expose interruptions to the user.
+
+The application owns admission, run transitions, durable checkpoints, attempt
+records, assets, and notifications. Adapters own provider mapping, polling,
+handles, cancellation, and error classification, including whether submission
+is definitely unaccepted or ambiguous. Shared helpers enforce bounded safe
+retries. Show a stage when the provider has no meaningful progress percentage.
+
+Ship a controllable fake provider first. It creates images with sharp and can
+simulate direct responses, remote handles, delays, failures, and cancellation
+races without paid calls.
+
+## 8. Persistence and assets
+
+SQLite stores collections, rows/revisions, columns/revisions, runs/attempts,
+command receipts, assets, run-output links, input references, and a compact change
+log. Use foreign keys, migrations, WAL mode, and indexes for queued work and cell
+history. Keep the database on local disk.
+
+Use `better-sqlite3` directly on the main thread behind repository functions.
+Application services own short, bounded transactions; no transaction spans a
+provider request or filesystem operation. Use async provider HTTP, filesystem
+I/O, and sharp operations. Measure query duration and event-loop delay before
+introducing a database worker. Large scans and synchronous disk work can still
+stall the process.
 
 ```text
 data/
@@ -149,56 +492,173 @@ data/
   tmp/
 ```
 
-Store file locations relative to the data directory. Resolve all asset reads by asset ID through metadata rather than interpreting IDs as arbitrary filesystem paths. Serve original media and thumbnails through the backend. Keep API credentials in server-side environment configuration, and exclude them from stored run snapshots and browser responses.
+Assets record media kind, MIME type, bytes, dimensions, optional duration,
+checksum, provenance, and optional label. Resolve reads by asset ID through
+metadata; store paths relative to the data directory. Serve originals and
+thumbnails through the backend with immutable cache semantics.
 
-An asset records media type, byte size, dimensions, optional duration, checksum, and upload or generation provenance. Stream bytes to a temporary file, validate the media, and atomically rename within the same filesystem before committing the ready asset record. Link all required outputs and mark the run successful in a database transaction after their original files are available. Thumbnails may finish separately.
+### Ingest and recovery
 
-Filesystem operations and SQLite commits are not one transaction. Use deterministic run/output staging references so a restart can reconcile a file written before its database commit. Clean up abandoned temporary or unreferenced files after a grace period. Never overwrite immutable original bytes. A missing original is a visible storage error, not a successful result.
+1. Persist remote output descriptors before downloading. For inline results,
+   stage bytes locally and record staging references as soon as possible.
+2. Persist the `downloading` phase and descriptors needed to resume acquisition.
+3. Stream each output to a temporary file, validate media and compute its
+   checksum/metadata, then atomically rename within the same filesystem.
+4. Commit ready asset records, ordered output links, and run success together
+   after all required original files exist. Thumbnails can finish separately.
 
-Provider download URLs are retrieval locations, not permanent asset identities. Copy outputs locally promptly. For input images, the adapter must upload local bytes or use a provider-supported attachment mechanism: a remote provider cannot fetch a localhost asset URL. Retain temporary provider upload handles as execution metadata; keep the permanent specification tied to local asset IDs.
+Filesystem writes and SQLite commits are not one transaction. Use deterministic
+run/output staging references so recovery can identify files written before their
+database commit. Retry output acquisition or resume the original provider job
+when possible. If a direct response is lost before local staging and the provider
+offers no recovery, surface the interruption. Never generate a replacement just
+because local storage failed.
 
-Removing a row or column archives its configuration/history. Removing a collection does not delete images used elsewhere. Start with explicit deletion and retain referenced assets, including historical references. A later garbage collector can compute reachability before removing bytes. For backup, stop the server and copy the data directory, or use a coordinated [SQLite online backup](https://www.sqlite.org/backup.html) and copy the immutable assets referenced by that snapshot.
+Never overwrite original bytes. A missing original is a visible storage error.
+Clean abandoned temporary files after a grace period, while retaining files used
+by unfinished recovery. Provider output URLs are temporary retrieval locations;
+copy their bytes locally promptly. For input images, upload local bytes or use a
+provider attachment mechanism; providers cannot fetch localhost asset URLs.
 
-**Reactive reads.** Use a normal command/query interface plus server-sent events for browser notifications. One stream can cover the application's relevant changes. SSE supports browser reconnection and event IDs, and TanStack Query can refetch the affected collection or cell when notified. [SSE documentation](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events/Using_server-sent_events), [TanStack Query invalidation](https://tanstack.dev/query/latest/docs/framework/react/guides/query-invalidation).
+### Retention and backup
 
-Append a compact change record with a monotonically increasing sequence in the same transaction as each mutation. Notifications contain IDs, versions, and change kinds, not image bytes. This closes the gap where the database commits but the process exits before broadcasting. The database is the authoritative state; the change log is for notification delivery, not an event-sourced domain model.
+Removing a row, column, or collection archives it and retains configuration,
+history, and referenced assets. Historical request inputs count as references.
+Asset deletion is explicit and allowed only when no retained object references
+it; permanent history deletion and bulk garbage collection are deferred. Reusing
+an image in another collection keeps it independently reachable.
 
-A snapshot includes its change cursor, read in the same database transaction. The stream replays changes after that cursor and continues tailing them without a subscribe gap. On reconnect, replay from the last cursor; if that history was pruned, request a fresh snapshot. Coalesce refetches during bursts and bound slow-client buffering. The initial implementation can simply invalidate the collection query; finer cell queries can follow when collection sizes justify them.
+For the first version, stop the server and copy the data directory for backup.
+A later live backup can coordinate a SQLite snapshot with copies of all immutable
+assets referenced by that snapshot.
 
-UI edits use optimistic concurrency through expected edit versions, separate from generation revision numbers. A browser save based on an old version cannot overwrite a newer external-agent edit. Surface that conflict while preserving the local draft. The same rule applies to all transports.
+## 9. Reactive reads and concurrent edits
 
-**The conceptual application API.** Expose operations on experiments, rather than database tables or provider HTTP requests. Each command validates, persists its outcome, and returns promptly with IDs, edit versions, and queued run references. It does not wait for image generation.
+Every mutation appends a compact change record with an increasing sequence in
+the same transaction as its data changes. Notifications contain IDs, versions,
+and change kinds. The change log delivers notifications; SQLite's domain tables
+remain the source of truth.
 
-| Area | Operations |
+A collection snapshot includes its change cursor, read in the same transaction.
+The SSE stream replays changes after that cursor and continues tailing without a
+subscription gap. An in-process post-commit notification wakes stream readers;
+the durable log supplies the events. On reconnect, replay after the last cursor.
+If retained history no longer covers it, tell the client to fetch a new snapshot.
+
+Initially, the UI invalidates and refetches the collection query after relevant
+events. Coalesce refetches during bursts and bound slow-client buffering. Finer
+cell queries can follow when collection sizes justify them.
+
+Use expected edit versions for updates, separate from generation revision
+numbers. Metadata and pause changes can advance edit versions without creating
+generation revisions. A stale browser or agent edit returns a conflict and
+preserves the local draft. Apply this rule to every transport and validate all
+expected versions before committing a batch.
+
+## 10. Command/query registry and transports
+
+Define each operation once, with its name, Zod input/output schemas, and handler:
+
+```ts
+interface Operation<I, O> {
+  name: string;
+  kind: 'command' | 'query';
+  input: ZodType<I>;
+  output: ZodType<O>;
+  run(input: I, context: ApplicationContext): Promise<O>;
+}
+```
+
+Handlers invoke application services and repositories. Commands validate,
+commit, and return promptly with updated objects, edit versions, a change cursor,
+and queued run references. They do not wait for provider generation.
+
+| Group | Operations |
 | --- | --- |
-| Collections | Create, list, inspect, rename, duplicate, pause/resume, archive. A duplicate starts paused and copies current configuration and pinned inputs; it does not copy runs or generate immediately. |
-| Rows | Add, update inputs with an expected version, reorder, pause/resume, inspect/restore revisions, archive. |
-| Columns | Add a model configuration, revise or duplicate it, reorder, inspect revisions, archive. |
-| Generation | Generate again for a cell/row/collection, inspect runs, request cancellation, explicitly resolve an uncertain submission. |
-| Assets | Upload, inspect metadata/provenance, read image or thumbnail, reference as input. |
-| Reading | Get a collection grid snapshot, list cell history, inspect a run's full resolved specification. |
-| Capabilities | List configured providers/models and describe supported inputs and settings. |
-| Changes | Read changes since a cursor, with optional bounded waiting. |
+| `models` | List configured models and describe capabilities/settings schemas. |
+| `collections` | Create, list, get grid snapshot, update title/description, duplicate, pause/resume, archive. |
+| `rows` | Add (including arrays), update, reorder, pause/resume, list/restore revisions, archive. |
+| `columns` | Add, update, duplicate, reorder, list/restore revisions, archive. |
+| `cells` | Get current view and history; regenerate a cell, row, or collection. |
+| `runs` | Inspect request/execution, request cancellation, resolve uncertain work. |
+| `assets` | Upload, list, get metadata/provenance, label, read original/thumbnail, delete if unreferenced. |
+| `changes` | Read after a cursor, optionally waiting for a bounded interval. |
+| `batch` | Apply an atomic group of configuration edits. |
 
-Support an atomic batch of row/column edits so an external client can construct or revise a grid without submitting intermediate combinations. Compute generation intents for the final batch state. For interactive edits, the short backend coalescing delay gives the same convenience on a smaller scale. A paused collection is useful for preparing a larger experiment before resuming it.
+Use readable addresses such as `portraits/r3/model-a` wherever a cell is expected,
+and run IDs for unambiguous history references. A grid snapshot includes row
+inputs, column configurations, edit/revision numbers, current run statuses,
+unsupported reasons, asset IDs/thumbnail URLs, and history counts. It is the
+primary document for both browser and external-agent reads.
 
-External agents can use ordinary reads and bounded waits; push support is optional. Future MCP tools delegate to these operations and return the same readable IDs and structured statuses. No embedded agent runtime is needed.
+HTTP exposes registry operations at `POST /api/<group>.<operation>`, with optional
+GET aliases for reads. Assets and `/api/events` use dedicated binary/streaming
+handlers. Uploads use a binary transport into the same asset ingestion service;
+large image bytes do not pass through ordinary JSON command envelopes.
 
-**Provider boundary.** Implement one adapter per provider, with model descriptions and settings schemas inside it. Use an official SDK where it exposes the required lifecycle, otherwise a small direct HTTP wrapper.
+MCP tools reuse the registry's validation and application behavior, translating
+results into structured content and image content where supported. Tool names
+can map dots to underscores. Streamable HTTP can run in the server; a separate
+stdio bridge calls the existing server and does not start another runner.
 
-The conceptual contract is `describeModels`, `prepare`, `submit`, `poll`, and optional `cancel`. Preparation validates and resolves a row/column pair into a serializable request specification. Submission returns either a completed result or a durable remote handle. Polling returns pending, completed, or failed. Output descriptors identify bytes or retrievable files plus provider metadata; the central asset store owns their permanent persistence.
+Agents can perform `edit → changes wait → inspect`. Waiting takes a cursor and a
+timeout, returns immediately when newer changes already exist, and never assumes
+that a quiet or paused collection has finished its pending work. Push support and
+an embedded agent runtime are unnecessary for this loop.
 
-Keep preparation deterministic and free of network side effects. Temporary input uploads belong to execution and are recorded for recovery. Save the prepared provider payload, adapter version, model reference, source asset IDs, and resolved settings before submitting, excluding secrets. Replaying a historical experiment uses its recorded configuration with an explicit new run; a backend deployment never automatically regenerates old experiments.
+## 11. UI
 
-The application owns lifecycle, retries, scheduling, persistence, and notifications. Adapters own provider-specific mapping, capabilities, remote handles, cancellation behavior, and error classification, including whether a failed submission is definitely unaccepted or ambiguous. Provider progress is optional; show a stage when meaningful progress percentages are unavailable.
+| Route | View |
+| --- | --- |
+| `/` | Collections with live/paused state, cell counts, and pending work. |
+| `/c/:slug` | Grid with editable row prompts/inputs, column model/settings controls, pause/resume, and add row/column actions. |
+| `/c/:slug/:row/:column` | Large result, output selector, run history, resolved request, errors, regenerate/cancel, and “Use as input.” |
+| `/assets` | Uploaded/generated asset library with previews, labels, and input selection. |
 
-**Implementation sequence.** Start with one repository containing `web`, `server`, and shared contracts, with ordinary server modules for the application service, scheduler, providers, database, and assets. They are module boundaries, not separate services.
+Cells show generation phase or a specific draft, unsupported, paused, failed, or
+uncertain state. Preserve the distinction between the current run's status and a
+previous image displayed beneath it. Show errors per cell so a partial row failure
+does not hide successful comparisons. History inspection and revision restoration
+are separate actions.
 
-1. Build SQLite persistence, revisions, short IDs, commands/queries, and asset ingestion. Use a deterministic fake provider to exercise job lifecycle and recovery without paid calls.
-2. Build the reactive grid, prompt editing, column configuration, pause/resume, cell status, and history viewer.
-3. Add two real providers with different execution styles to verify the abstraction. Exercise upload-to-input reuse and copying generated images between collections.
-4. Add the thin MCP transport once these operations behave consistently from the UI and service tests.
+Use TanStack Query for server snapshots and local component state for unsaved
+drafts. The backend remains responsible for validation, revision creation,
+coalescing, and generation regardless of which client made the edit.
 
-The highest-value verification cases are duplicate commands, row-only/column-only invalidation, pause followed by resume, out-of-order completions, edits during active runs, partial row failures, cancellation races, a crash around submission, restart during polling/download, immutable input reuse, and reconnecting after missed notifications. Use temporary SQLite databases and a controllable fake provider for these tests.
+## 12. Configuration and implementation sequence
 
-The first usable milestone is a live collection with several prompts and two model columns, durable background generation, automatic UI updates, prior-result inspection, and reuse of any output as a pinned input. Keep the initial system focused on that loop; its existing domain boundaries can support video outputs and a separate worker process when those become concrete requirements.
+Server configuration supplies the data directory, localhost port, global
+concurrency, provider-account concurrency, credentials, and operation timeouts.
+Keep credentials in server-side environment configuration, excluded from browser
+responses and request snapshots. The model registry lives in code. Development
+uses Vite's proxy; production serves the built UI from the same backend.
+
+Build in this order:
+
+1. Shared contracts, IDs, revisions, SQLite repositories, transactional commands,
+   and asset ingestion.
+2. Runner, checkpoints/recovery, fake provider, change log, HTTP, and SSE. At this
+   point an HTTP client can drive the complete generation loop.
+3. Collection grid, editing, pause/resume, cell status, history, and asset reuse.
+4. Two real providers with different execution styles, validating both direct
+   response and recoverable remote-job behavior.
+5. MCP transport over the same registry and services.
+
+Use temporary SQLite databases and a controllable fake provider to verify:
+
+- Duplicate commands and automatic-run uniqueness, including terminal runs.
+- Row-only/column-only generation, no-op saves, restore behavior, and atomic batches.
+- Draft/unsupported cells, pause/resume, archive, and obsolete queued work.
+- Out-of-order completions, manual reruns, partial failures, and cancellation races.
+- Crashes around submission, provider-handle persistence, polling, and downloads.
+- File/database commit gaps, pinned input reuse, and reservation recovery.
+- Snapshot/stream races, missed notifications, and conflicting browser/agent edits.
+
+The first usable milestone is a live collection with several prompts, two model
+columns, durable background generation, automatic UI updates, prior-result
+inspection, and reuse of any output as a pinned input.
+
+Defer video-specific adapters/UI, dynamic input dependencies, reusable presets,
+collection export/import, permanent history deletion and bulk asset GC, detailed
+cost reporting, multi-user/network access, and multiple workers. Keep the current
+boundaries suitable for adding these when needed.
