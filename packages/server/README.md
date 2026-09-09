@@ -23,6 +23,12 @@ Config comes from env (`.env` at the repo root is loaded by `main.ts`):
 when no real key is present. `createApp(overrides)` in `src/app.ts` boots the
 same thing programmatically (tests use it with a temp data dir).
 
+## Browsing the API
+
+`GET /api` (e.g. http://localhost:4747/api) returns every command with its
+description and JSON Schemas for input and output. The source of truth is
+`packages/core/src/commands.ts`; the walkthrough below shows the common calls.
+
 ## Layout
 
 | Path | What |
@@ -74,7 +80,7 @@ curl -s "$B/api/collections.get?collection=neon-cats" | jq '.cells[] | {address,
 # Images (long-lived cache headers; a missing original is a 500 storage error, not a blank)
 ID=$(curl -s "$B/api/collections.get?collection=neon-cats" | jq -r '.cells[0].outputs[0]')
 curl -sI $B/assets/$ID | grep -i content-type          # image/png
-curl -sI $B/assets/$ID/thumb | grep -i content-type    # image/webp, max 320px
+curl -sI $B/assets/$ID/thumb | grep -i content-type    # image/webp, max 800px
 
 # Edit a row: only that row's cells get new generations. Revert it: the old
 # generation with the same hash becomes current again with no new run.

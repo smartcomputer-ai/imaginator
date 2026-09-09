@@ -1,5 +1,6 @@
+import { useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router';
-import { assetThumbUrl, isActiveStatus, type CellView } from '@imaginator/core';
+import { assetThumbUrl, assetUrl, isActiveStatus, type CellView } from '@imaginator/core';
 import { RefreshCw, RotateCcw, X } from 'lucide-react';
 import { useCommand } from '@/api/queries';
 import { StatusBadge } from '@/components/StatusBadge';
@@ -8,20 +9,39 @@ import { Button } from '@/components/ui/button';
 import { WithTooltip } from '@/components/ui/tooltip';
 import { cn } from '@/lib/utils';
 
-export const CELL_SIZE = 148;
+/** Hover preview is 50% larger than the cell and never crops. */
+function previewSize(cellSize: number): number {
+  return Math.round(cellSize * 1.5);
+}
 
 const RETRYABLE = new Set(['failed', 'unsupported', 'needs_attention']);
 
-export function GridCell({ slug, cell }: { slug: string; cell: CellView | undefined }) {
+export function GridCell({ slug, cell, size }: { slug: string; cell: CellView | undefined; size: number }) {
   if (!cell) return <div className="text-[11px] text-muted-foreground">–</div>;
   const status = cell.status;
   const active = status !== 'missing' && isActiveStatus(status);
   const thumbs = cell.thumbnails.length ? cell.thumbnails : cell.outputs.map(assetThumbUrl);
   const hasImage = status === 'succeeded' && thumbs.length > 0;
   const tooltip = cell.error?.message;
+  const [preview, setPreview] = useState(false);
+  const timer = useRef<number | undefined>(undefined);
+  useEffect(() => () => window.clearTimeout(timer.current), []);
+  const onEnter = () => {
+    window.clearTimeout(timer.current);
+    timer.current = window.setTimeout(() => setPreview(true), 250);
+  };
+  const onLeave = () => {
+    window.clearTimeout(timer.current);
+    setPreview(false);
+  };
 
   return (
-    <div className="group relative" style={{ width: CELL_SIZE, height: CELL_SIZE }}>
+    <div
+      className="group relative"
+      style={{ width: size, height: size }}
+      onMouseEnter={hasImage ? onEnter : undefined}
+      onMouseLeave={hasImage ? onLeave : undefined}
+    >
       <Link
         to={`/c/${slug}/${cell.row}/${cell.column}`}
         className={cn(
@@ -32,11 +52,11 @@ export function GridCell({ slug, cell }: { slug: string; cell: CellView | undefi
       >
         {hasImage ? (
           thumbs.length === 1 ? (
-            <img src={thumbs[0]} alt={cell.address} className="size-full object-cover" loading="lazy" draggable={false} />
+            <img src={thumbs[0]} alt={cell.address} className="size-full object-contain" loading="lazy" draggable={false} />
           ) : (
             <div className={cn('grid size-full gap-px', thumbs.length <= 4 ? 'grid-cols-2' : 'grid-cols-3')}>
               {thumbs.slice(0, 9).map((t, i) => (
-                <img key={i} src={t} alt={`${cell.address} #${i + 1}`} className="size-full object-cover" loading="lazy" draggable={false} />
+                <img key={i} src={t} alt={`${cell.address} #${i + 1}`} className="size-full object-contain" loading="lazy" draggable={false} />
               ))}
             </div>
           )
@@ -44,6 +64,15 @@ export function GridCell({ slug, cell }: { slug: string; cell: CellView | undefi
           <StatusBadge status={status} tooltip={tooltip} />
         )}
       </Link>
+      {hasImage && (
+        <HoverPreview
+          to={`/c/${slug}/${cell.row}/${cell.column}`}
+          urls={cell.urls.length ? cell.urls : cell.outputs.map(assetUrl)}
+          address={cell.address}
+          visible={preview}
+          cellSize={size}
+        />
+      )}
 
       {/* Bottom-left hints */}
       <div className="pointer-events-none absolute bottom-1 left-1 flex flex-wrap gap-1">
@@ -122,5 +151,37 @@ export function CellActions({
         </Button>
       </WithTooltip>
     </>
+  );
+}
+
+/**
+ * Larger, uncropped preview of a cell's outputs, centered over the cell. It
+ * lives inside the cell's hover group so it stays open while the pointer is on
+ * it, and it is a link to the cell detail like the cell itself.
+ */
+function HoverPreview({ to, urls, address, visible, cellSize }: { to: string; urls: string[]; address: string; visible: boolean; cellSize: number }) {
+  if (!visible) return null;
+  const PREVIEW_SIZE = previewSize(cellSize);
+  const offset = Math.round((cellSize - PREVIEW_SIZE) / 2);
+  const shown = urls.slice(0, 4);
+  return (
+    <Link
+      to={to}
+      title={address}
+      className="absolute z-40 flex items-center justify-center overflow-hidden rounded-md border bg-popover shadow-xl ring-1 ring-ring"
+      style={{ top: offset, left: offset, width: PREVIEW_SIZE, height: PREVIEW_SIZE }}
+    >
+      {shown.length === 1 ? (
+        <img src={shown[0]} alt={address} className="max-h-full max-w-full object-contain" draggable={false} />
+      ) : (
+        <div className="grid size-full grid-cols-2 gap-px">
+          {shown.map((u, i) => (
+            <div key={u} className="flex items-center justify-center overflow-hidden">
+              <img src={u} alt={`${address} #${i + 1}`} className="max-h-full max-w-full object-contain" draggable={false} />
+            </div>
+          ))}
+        </div>
+      )}
+    </Link>
   );
 }

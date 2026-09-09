@@ -53,11 +53,12 @@ export interface PlacedFile extends AnalyzedFile {
   finalPath: string;
 }
 
-export const THUMB_MAX = 320;
+/** Longest edge of thumbnails. Encoded in the filename so a change here rebuilds them lazily. */
+export const THUMB_MAX = 800;
 
 /**
  * Filesystem side of assets. `data/tmp` holds staged bytes; `data/assets/<shard>/`
- * holds originals plus `<id>.thumb.webp`. Rows live in the DB (services).
+ * holds originals plus `<id>.thumb<THUMB_MAX>.webp`. Rows live in the DB (services).
  */
 export class AssetStore {
   readonly assetsDir: string;
@@ -137,7 +138,21 @@ export class AssetStore {
   }
 
   thumbPath(id: string): string {
-    return path.join(this.shardDir(id), `${id}.thumb.webp`);
+    return path.join(this.shardDir(id), `${id}.thumb${THUMB_MAX}.webp`);
+  }
+
+  /** Remove every thumbnail variant of an asset, including ones from older THUMB_MAX values. */
+  async removeThumbs(id: string): Promise<void> {
+    const dir = this.shardDir(id);
+    let files: string[] = [];
+    try {
+      files = await fsp.readdir(dir);
+    } catch {
+      return;
+    }
+    await Promise.all(
+      files.filter((f) => f.startsWith(`${id}.thumb`)).map((f) => fsp.unlink(path.join(dir, f)).catch(() => {})),
+    );
   }
 
   /** Atomically move an analyzed staged file into its final location. */
@@ -162,7 +177,7 @@ export class AssetStore {
 
   async removeFiles(id: string, ext: string): Promise<void> {
     await fsp.unlink(this.originalPath(id, ext)).catch(() => {});
-    await fsp.unlink(this.thumbPath(id)).catch(() => {});
+    await this.removeThumbs(id);
   }
 
   async discardStaged(filePath: string): Promise<void> {
@@ -193,7 +208,7 @@ export class AssetStore {
     try {
       await sharp(original, { animated: false })
         .resize({ width: THUMB_MAX, height: THUMB_MAX, fit: 'inside', withoutEnlargement: true })
-        .webp({ quality: 80 })
+        .webp({ quality: 85 })
         .toFile(tmp);
       await fsp.rename(tmp, thumb);
     } catch (e) {
@@ -252,7 +267,7 @@ export class AssetStore {
         continue;
       }
       for (const f of files) {
-        if (f.includes('.thumb.') || f.endsWith('.tmp')) continue;
+        if (f.includes('.thumb') || f.endsWith('.tmp')) continue;
         const id = f.slice(0, f.indexOf('.'));
         if (id) out.set(id, path.join(dir, f));
       }

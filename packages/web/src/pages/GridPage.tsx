@@ -8,7 +8,8 @@ import { Spinner } from '@/components/ui/spinner';
 import { AddColumnDialog } from '@/features/grid/AddColumnDialog';
 import { AddRowDialog } from '@/features/grid/AddRowDialog';
 import { ColumnHeader } from '@/features/grid/ColumnHeader';
-import { CELL_SIZE, GridCell } from '@/features/grid/GridCell';
+import { GridCell } from '@/features/grid/GridCell';
+import { useCellSize } from '@/features/grid/zoom';
 import { GridHeader } from '@/features/grid/GridHeader';
 import { RowHeader } from '@/features/grid/RowHeader';
 
@@ -21,6 +22,7 @@ export function GridPage() {
   const models = useModels();
   const [addColumn, setAddColumn] = useState(false);
   const [addRow, setAddRow] = useState(false);
+  const zoom = useCellSize();
 
   const modelById = useMemo(() => new Map((models.data?.models ?? []).map((m) => [m.id, m])), [models.data]);
   const columns = useMemo(() => [...(collection?.columns ?? [])].sort((a, b) => a.position - b.position), [collection]);
@@ -42,7 +44,7 @@ export function GridPage() {
 
   return (
     <div className="flex h-full min-h-0 flex-col">
-      <GridHeader collection={collection} />
+      <GridHeader collection={collection} zoom={zoom} />
       <div className="min-h-0 flex-1 overflow-auto">
         {columns.length === 0 && rows.length === 0 ? (
           <EmptyState onAddColumn={() => setAddColumn(true)} onAddRow={() => setAddRow(true)} />
@@ -54,7 +56,7 @@ export function GridPage() {
                   {rows.length} rows × {columns.length} columns
                 </th>
                 {columns.map((col, i) => (
-                  <th key={col.id} className="sticky top-0 z-10 border-b border-r bg-card p-0 align-top font-normal" style={{ minWidth: CELL_SIZE + 12, width: CELL_SIZE + 12 }}>
+                  <th key={col.id} className="sticky top-0 z-10 border-b border-r bg-card p-0 align-top font-normal" style={{ minWidth: zoom.cellSize + 12, width: zoom.cellSize + 12 }}>
                     <ColumnHeader slug={slug} column={col} model={modelById.get(col.model)} index={i} total={columns.length} order={columnOrder} />
                   </th>
                 ))}
@@ -73,7 +75,7 @@ export function GridPage() {
                   </td>
                   {columns.map((col) => (
                     <td key={col.id} className="border-b border-r p-1.5 align-top">
-                      <GridCell slug={slug} cell={cellMap.get(`${row.id}/${col.id}`)} />
+                      <GridCell slug={slug} cell={cellMap.get(`${row.id}/${col.id}`)} size={zoom.cellSize} />
                     </td>
                   ))}
                   <td className="border-b" />

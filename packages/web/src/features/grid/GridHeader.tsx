@@ -1,7 +1,7 @@
 import { useRef, useState } from 'react';
 import { Link, useNavigate } from 'react-router';
 import type { CollectionView } from '@imaginator/core';
-import { Columns3, Copy, Download, MoreHorizontal, Pencil, Rows3, Settings2, Trash2, Upload } from 'lucide-react';
+import { Columns3, Copy, Download, MoreHorizontal, Pencil, Rows3, Settings2, Trash2, Upload, ZoomIn, ZoomOut } from 'lucide-react';
 import { useApi, useCommand } from '@/api/queries';
 import { CommonSettingsForm } from '@/components/CommonSettingsForm';
 import { InlineTextarea } from '@/components/InlineEdit';
@@ -16,8 +16,9 @@ import { downloadJson } from '@/lib/utils';
 import { toast } from 'sonner';
 import { AddColumnDialog } from './AddColumnDialog';
 import { AddRowDialog } from './AddRowDialog';
+import type { useCellSize } from './zoom';
 
-export function GridHeader({ collection }: { collection: CollectionView }) {
+export function GridHeader({ collection, zoom }: { collection: CollectionView; zoom: ReturnType<typeof useCellSize> }) {
   const navigate = useNavigate();
   const api = useApi();
   const slug = collection.slug;
@@ -103,6 +104,15 @@ export function GridHeader({ collection }: { collection: CollectionView }) {
             )}
           </PopoverContent>
         </Popover>
+        <div className="flex items-center rounded-md border">
+          <Button variant="ghost" size="sm" className="rounded-r-none" onClick={zoom.zoomOut} disabled={!zoom.canZoomOut} title="Smaller cells">
+            <ZoomOut />
+          </Button>
+          <span className="min-w-10 text-center text-[11px] tabular-nums text-muted-foreground">{zoom.cellSize}px</span>
+          <Button variant="ghost" size="sm" className="rounded-l-none" onClick={zoom.zoomIn} disabled={!zoom.canZoomIn} title="Larger cells">
+            <ZoomIn />
+          </Button>
+        </div>
         <Button variant="outline" size="sm" onClick={() => setAddColumn(true)}>
           <Columns3 /> Add column
         </Button>

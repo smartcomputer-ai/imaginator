@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { type JsonObject, type ModelInfo } from '@imaginator/core';
+import { slugify, type JsonObject, type ModelInfo } from '@imaginator/core';
 import { useCommand, useModels } from '@/api/queries';
 import { SettingsForm } from '@/components/SettingsForm';
 import { Badge } from '@/components/ui/badge';
@@ -38,7 +38,7 @@ export function AddColumnDialog({ slug, open, onOpenChange, existingIds }: { slu
   }, [models.data]);
 
   const model = models.data?.models.find((m) => m.id === modelId);
-  const shortName = modelId ? modelId.slice(modelId.indexOf('/') + 1) : '';
+  const shortName = modelId ? slugify(modelId.slice(modelId.indexOf('/') + 1)) || 'column' : '';
   const suggestedId = useMemo(() => {
     if (!shortName) return '';
     let candidate = shortName;

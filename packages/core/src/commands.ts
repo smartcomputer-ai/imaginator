@@ -519,6 +519,8 @@ export function commandDef<N extends CommandName>(name: N): CommandDefs[N] {
 export function assetUrl(id: string): string {
   return `/assets/${id}`;
 }
+/** Bumped when thumbnail rendering changes; thumbs are cached immutably, so the URL must change. */
+export const THUMB_VERSION = 2;
 export function assetThumbUrl(id: string): string {
-  return `/assets/${id}/thumb`;
+  return `/assets/${id}/thumb?v=${THUMB_VERSION}`;
 }

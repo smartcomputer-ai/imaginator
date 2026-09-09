@@ -156,7 +156,7 @@ export function createAssetService(ctx: ServiceContext) {
         }
         for (const [id, file] of orphans) {
           await fsp.unlink(file).catch(() => {});
-          await fsp.unlink(path.join(path.dirname(file), `${id}.thumb.webp`)).catch(() => {});
+          await store.removeThumbs(id);
         }
       }
       return { removed: unreferenced.map((a) => a.id), orphanFiles: orphans.length, dryRun };

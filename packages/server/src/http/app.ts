@@ -4,6 +4,7 @@ import { Readable } from 'node:stream';
 import { Hono, type Context } from 'hono';
 import { cors } from 'hono/cors';
 import { streamSSE } from 'hono/streaming';
+import { z } from 'zod';
 import { commandNames, type ImaginatorEvent } from '@imaginator/core';
 import type { AssetStore } from '../assets/store.js';
 import type { CommandRegistry } from '../commands/registry.js';
@@ -66,6 +67,39 @@ export function createHttpApp(deps: HttpDeps): HttpApp {
   });
 
   app.get('/api/health', (c) => c.json({ ok: true, bootId: deps.bus.bootId }));
+
+  // -- Self-describing index: every command with its JSON schemas -----------------
+  app.get('/api', (c) => {
+    const commands = commandNames.map((name) => {
+      const def = deps.commands[name];
+      const toSchema = (schema: z.ZodTypeAny) => {
+        try {
+          return z.toJSONSchema(schema, { unrepresentable: 'any', io: 'input' });
+        } catch {
+          return { description: 'schema not representable' };
+        }
+      };
+      return {
+        name,
+        kind: def.kind,
+        description: def.description,
+        http: def.kind === 'read' ? [`POST /api/${name}`, `GET /api/${name}?<params>`] : [`POST /api/${name}`],
+        input: toSchema(def.input),
+        output: toSchema(def.output),
+      };
+    });
+    return c.json({
+      commands,
+      other: {
+        'GET /api/health': 'liveness + bootId',
+        'GET /api/events?collection=<slug>': 'server-sent events: hello, then ImaginatorEvent per line',
+        'POST /api/assets.upload (multipart/form-data: file, label?)': 'file upload alternative to the JSON form',
+        'GET /assets/:id': 'original asset bytes',
+        'GET /assets/:id/thumb': 'webp thumbnail',
+      },
+      errors: '{ error: { message, code, issues? } } with 400 validation / 404 not found / 409 conflict / 500',
+    });
+  });
 
   // -- SSE ------------------------------------------------------------------------
   app.get('/api/events', (c) => {
