@@ -1,0 +1,22 @@
+{
+  "name": "imaginator",
+  "private": true,
+  "version": "0.1.0",
+  "packageManager": "pnpm@10.15.1",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "build": "pnpm -r --filter ./packages/core --filter ./packages/server --filter ./packages/web run build",
+    "typecheck": "pnpm -r run typecheck",
+    "test": "pnpm -r run test",
+    "dev": "pnpm -r --parallel run dev",
+    "dev:server": "pnpm --filter @imaginator/server run dev",
+    "dev:web": "pnpm --filter @imaginator/web run dev",
+    "start": "pnpm --filter @imaginator/server run start",
+    "mcp": "pnpm --filter @imaginator/server run mcp"
+  },
+  "devDependencies": {
+    "typescript": "~5.9.2",
+    "vitest": "^5.0.0",
+    "@types/node": "^22.10.2"
+  }
+}
