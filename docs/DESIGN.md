@@ -120,7 +120,7 @@ is a different experiment from one asking for one.
   id: 'r3',
   prompt: string,
   negativePrompt?: string,
-  inputs: { asset: AssetId, role: string }[],  // in order; role is 'reference', 'init', 'mask', ...
+  inputs: { asset: AssetId, role: 'reference' | 'init' | 'mask', maskFor?: number }[],
   settings?: CommonSettings,         // overrides collection defaults
   paused: boolean,
   position: number,
@@ -128,17 +128,19 @@ is a different experiment from one asking for one.
 }
 ```
 
-Input roles are the small vocabulary models understand: `reference` (style or
+Inputs stay in order. Roles express application intent: `reference` (style or
 subject guidance), `init` (image-to-image source), `mask` (inpainting region).
-Each model declares which roles it accepts and how many images in total. A row
-whose inputs use a role the column's model does not accept is `unsupported`
-for that column (§4.1); the image is never passed under a different role.
+A mask's required `maskFor` is the zero-based index of its `init` target;
+other roles cannot set it. Adapters map roles to native fields without changing
+their meaning. Model validation checks role combinations and per-role counts,
+mask/target compatibility, and input MIME, byte and dimension limits. An
+unsupported combination makes that cell `unsupported` (§4.1).
 
 ### Settings
 Two disjoint bags, owned by different things:
 
 - **CommonSettings** (`aspectRatio`, `size`, `seed`, `outputFormat`):
-  a small vocabulary every provider understands. Owned by the **row**;
+  a small shared vocabulary, supported selectively by models. Owned by the **row**;
   collection defaults fill gaps. Resolution: `collection.defaults` ← `row.settings`.
 - **ModelSettings** (`quality`, `style`, `guidance`, `steps`, ...):
   provider-specific knobs declared by the model's zod schema. Owned by the
@@ -154,6 +156,9 @@ dropped at resolution time and the drop is recorded on the generation so the
 UI can show "seed ignored by this model". Anything stronger than a dropped
 key, such as input images a model cannot take, is never dropped; the cell
 becomes `unsupported` instead (§4.1).
+Invalid values for supported keys also make the cell `unsupported`. After
+dropping unsupported keys, a concrete `size` and `aspectRatio` must agree;
+neither silently overrides the other.
 
 ### Generation
 ```ts
@@ -162,11 +167,11 @@ becomes `unsupported` instead (§4.1).
   collection: 'neon-cats', row: 'r3', column: 'flux-pro',
   version: 2,                        // ordinal within the cell
   requestHash: 'sha256…',            // hash of the cell's *content*, see §4.1
-  request: ResolvedRequest,          // full snapshot; reproducible later
+  request: ResolvedRequest,          // full snapshot; inspectable and reusable later
   status: 'queued' | 'submitting' | 'running' | 'downloading'
         | 'succeeded' | 'failed' | 'cancelled' | 'unsupported' | 'needs_attention',
-  providerRef?: string,              // remote job handle, persisted before the first poll
-  pendingOutputs?: OutputDescriptor[], // persisted before download, so a restart re-fetches
+  providerRef?: ProviderRef,         // durable adapter handle, persisted before monitoring
+  pendingOutputs?: PendingOutput[], // remote URLs or staged files; never inline bytes
   outputs: AssetId[],
   error?: { message, code?, retryable },   // also carries the `unsupported` reason
   attempt: number,
@@ -177,13 +182,13 @@ becomes `unsupported` instead (§4.1).
 }
 ```
 
-`ResolvedRequest` is what the provider actually receives: model, prompt,
-negative prompt, input asset IDs with roles, count, resolved settings with
+`ResolvedRequest` records the resolved application request: model, prompt,
+negative prompt, input asset IDs with roles and mask targets, count, settings with
 registry defaults filled in, the keys that were dropped as unsupported, and
-the registry version that did the resolving. It is fully materialized, so a
-generation is reproducible and comparable without looking at the row it came
-from. Rows can change; generations never do. Note that `requestHash` is *not*
-the hash of this snapshot; see §4.1 for why.
+the registry version that did the resolving. Adapters construct native wire
+requests from this snapshot. It preserves what was asked without consulting
+the current row; it does not guarantee identical images on rerun. The request
+snapshot is immutable. `requestHash` is *not* its hash; see §4.1 for why.
 
 ### Asset
 ```ts
@@ -217,7 +222,7 @@ generation is identified by `requestHash = hash(content(collection, row, column)
 `content()` is:
 
 - the column's model ID, its `settings` as written, and its `count`;
-- the row's prompt, negative prompt, and inputs with roles;
+- the row's prompt, negative prompt, and ordered inputs with roles and mask targets;
 - the row's common settings after applying collection defaults, with keys the
   model does not honor removed.
 
@@ -271,7 +276,7 @@ accepts an idempotency key; a submission that times out without one becomes
 `needs_attention`, because it may have been accepted and charged.
 
 **Unsupported combinations make no request.** `resolve()` checks the row
-against the column model's capabilities: input roles and count, negative
+against the column model's capabilities and pure validator: input constraints, negative
 prompt, sizes and aspect ratios, and the column's `count` against the model's
 maximum. An incompatible pair gets a generation in status
 `unsupported` with a specific reason in `error`, and no provider call. Other
@@ -282,15 +287,15 @@ or column changes the hash, so the check simply runs again.
 **Superseded work is cancelled.** When a row edit changes a cell's hash while
 a generation for the old hash is still in flight:
 - `queued`, not yet submitted: marked `cancelled` at once.
-- Submitted: the runner aborts its local wait via `AbortSignal` and calls the
-  adapter's `cancel()` if it has one. `cancel()` answers `confirmed`,
-  `pending`, or `unsupported`. Only `confirmed` marks the generation
-  `cancelled`. `pending` keeps it monitored until the provider reports an
-  outcome; if completion wins the race the output is stored and the
-  generation `succeeded`. `unsupported`, or no `cancel()` at all, means the
-  job is monitored to completion and its output stored. A local abort is
-  never treated as a remote cancel. A superseded generation that completes
-  is real history; it just is not current.
+- Submitted: call `cancel()` when a handle and that method are available,
+  while keeping the result receiver alive. Only `confirmed` marks the
+  generation `cancelled`; `pending`, `unsupported`, or no cancellation support
+  means monitoring continues. If completion wins the race, store the output
+  as `succeeded`. Abort a receiver only after confirmed cancellation or when
+  a persisted handle and `resume()` allow monitoring to restart with a fresh
+  signal. Never abort a non-resumable response/stream just because it is
+  superseded. A local abort is not remote cancellation; completed superseded
+  work remains history, not the current cell.
 
 **"Give me another one"** is the one imperative: `cell regenerate` inserts a
 new generation with the same hash and `forced: true`. Useful for
@@ -326,15 +331,15 @@ per-model default.
 **Lifecycle.** A generation moves through persisted phases:
 
 ```
-queued → submitting → running → downloading → succeeded
+queued → submitting → [running, when a job handle exists] → downloading → succeeded
 ```
 
-`submitting` is written before the provider call. `providerRef` is written
-through `ctx.setProviderRef` the moment the provider accepts, before the
-first poll or sleep; that write commits synchronously. `downloading` is
-written, with the provider's output descriptors in `pendingOutputs`, before
-any bytes are fetched. Each phase boundary is what makes the recovery below
-possible.
+`submitting` is written before the provider call. If a job handle is returned,
+await `ctx.setProviderRef` to commit it and `running` atomically before any
+monitoring. Calls without a handle remain `submitting` until outputs arrive.
+Stage inline outputs to durable files first; then commit `downloading` with
+`pendingOutputs` containing URLs or staged paths, before downloading remote
+outputs. A crash before that commit remains ambiguous, not safe to resubmit.
 
 **Durability.** The `generations` table is the queue. There is no exactly-once
 guarantee across a local database and a paid remote API, so recovery is
@@ -347,7 +352,7 @@ than repeated. On boot, after the reconciler has cancelled stale queued work:
 | `submitting`, no `providerRef` | `needs_attention`. The request may have been accepted and charged; it is never resubmitted automatically. |
 | `running` with `providerRef`, adapter has `resume()` | `resume()` monitors the same job. `generate()` is never called again for it. |
 | `running` with `providerRef`, no `resume()` | `needs_attention`, handle kept for inspection. |
-| `downloading` | Re-fetch `pendingOutputs`; never regenerate. If the provider's URLs have expired, `failed` with a retrieval error. |
+| `downloading` | Reuse staged files or fetch `pendingOutputs` URLs; never regenerate. Missing files or expired URLs become `failed` with a retrieval error. |
 
 A `needs_attention` generation holds no runner slot but does hold the cell
 until `cell retry` inserts a fresh one. The UI shows it distinctly from
@@ -363,12 +368,14 @@ Each provider is a module implementing one small interface. No abstraction
 library; we own it.
 
 ```ts
+type ProviderRef = { version: number; model: string; data: JsonObject };
+
 interface Provider {
   id: string;                          // 'openai', 'bfl', 'fal', 'google', 'replicate', 'mock'
   models: ModelSpec[];
   generate(req: ResolvedRequest, ctx: GenerateContext): Promise<GenerateResult>;
-  resume?(providerRef: string, ctx: GenerateContext): Promise<GenerateResult>;
-  cancel?(providerRef: string): Promise<'confirmed' | 'pending' | 'unsupported'>;
+  resume?(providerRef: ProviderRef, ctx: GenerateContext): Promise<GenerateResult>;
+  cancel?(providerRef: ProviderRef): Promise<'confirmed' | 'pending' | 'unsupported'>;
 }
 
 interface ModelSpec {
@@ -379,11 +386,13 @@ interface ModelSpec {
     inputRoles: string[];              // [] = text-only; e.g. ['reference'], ['init', 'mask']
     maxInputImages: number;
     negativePrompt: boolean;
-    seed: boolean;
+    commonKeys: (keyof CommonSettings)[];
     count: number;                     // max per request
     aspectRatios?: string[];           // or sizes
     sizes?: string[];
+    outputFormats?: string[];
   };
+  validateRequest(req: ResolvedRequest, inputs: Asset[]): string[]; // pure; ordered metadata, errors
   settings: ZodObject;                 // model-specific keys, drives UI forms + validation
   concurrency?: number;
 }
@@ -391,14 +400,14 @@ interface ModelSpec {
 interface GenerateContext {
   signal: AbortSignal;
   asset(id: AssetId): Promise<{ bytes: Buffer; mime: string; path: string }>;
-  setProviderRef(ref: string): Promise<void>;   // persist remote job handle before the first poll/sleep
+  setProviderRef(ref: ProviderRef): Promise<void>; // commit handle + running before monitoring
   sleep(ms: number): Promise<void>;             // abortable
   log(msg: string): void;
 }
 
-type OutputDescriptor =
-  | { url: string; mime?: string; meta?: unknown }      // runner persists, then downloads
-  | { bytes: Buffer; mime: string; meta?: unknown };    // inline; staged to data/tmp
+type RemoteOutput = { url: string; mime?: string; meta?: unknown };
+type OutputDescriptor = RemoteOutput | { bytes: Buffer; mime: string; meta?: unknown };
+type PendingOutput = RemoteOutput | { stagedPath: string; mime: string; meta?: unknown };
 
 interface GenerateResult {
   outputs: OutputDescriptor[];
@@ -406,6 +415,11 @@ interface GenerateResult {
   providerMeta?: unknown;
 }
 ```
+
+`ProviderRef` is versioned, adapter-owned JSON containing everything needed
+after restart: model/endpoint, job ID, and returned polling/result/cancel URLs
+as applicable. It contains no API keys. Polling is the v1 baseline;
+adapters may use provider SSE internally without changing this interface.
 
 Adapters return descriptors, not stored assets; the runner owns persistence.
 Input images go the other way: a remote provider cannot fetch a localhost
@@ -439,8 +453,9 @@ sniff mime, compute sha256, read dimensions, then `rename()` into
 atomic. Only then insert the asset row, and for generation outputs, link the
 outputs and mark the generation `succeeded` in the same transaction. The webp
 thumbnail may be written afterwards. Originals are never overwritten, and a
-missing original is a visible storage error, not a blank cell. Files in
-`data/tmp` older than a grace period are swept on boot; a file under `assets/`
+missing original is a visible storage error, not a blank cell. Unreferenced files in
+`data/tmp` older than a grace period are swept on boot; staged files referenced
+by unfinished generations are preserved. A file under `assets/`
 with no row is removed by `assets gc`. Served at `/assets/:id` and
 `/assets/:id/thumb` with long cache headers, since content never changes.
 
@@ -559,6 +574,9 @@ present. The model registry is code; adding a model is adding a `ModelSpec`.
 
 ## 9. What is deliberately left for later
 
+- Provider webhooks and live progress/preview UI. Later, add separate optional
+  status, numeric progress, and preview callbacks to `GenerateContext`;
+  queue status is not an image preview, and previews are not final outputs.
 - Video: `Asset.kind` and `ModelSpec.kind` already allow it; a video adapter
   and a `<video>` cell renderer are the work.
 - Pinning a specific version as current instead of "newest matching".
@@ -589,4 +607,6 @@ download; pinned inputs surviving regeneration of their source cell; SSE
 reconnect after missed events; revert after regenerate finds the old hash
 with no new run; registry default change causes no new runs; `wait` on a
 cursor taken before an edit returns only after the reconcile pass; ambiguous
-submission timeout lands in `needs_attention` and is never resubmitted.
+submission timeout lands in `needs_attention` and is never resubmitted;
+superseding a non-resumable stream preserves its result; staged inline outputs
+survive restart; invalid input/mask combinations make no provider call.
