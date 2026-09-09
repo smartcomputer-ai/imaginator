@@ -51,6 +51,7 @@ imaginator/
     imaginator.db
     assets/k3/k3q2m7.png
     assets/k3/k3q2m7.thumb.webp
+    tmp/      # in-flight downloads and uploads, swept on boot
 ```
 
 ---
@@ -96,7 +97,7 @@ Asset  (uploaded | generated) ── file on disk + thumbnail + dimensions + mim
   title: 'Neon cats',
   description?: string,
   status: 'live' | 'paused',        // paused = edit freely, nothing generates
-  defaults: Settings,                // aspect ratio, count, seed, ...
+  defaults: CommonSettings,          // aspect ratio, count, seed, ...
   columns: Column[],
   rows: Row[],
   createdAt, updatedAt
@@ -105,7 +106,7 @@ Asset  (uploaded | generated) ── file on disk + thumbnail + dimensions + mim
 
 ### Column
 ```ts
-{ id: 'flux-pro', model: 'bfl/flux-pro-1.1', settings?: Settings, position: number }
+{ id: 'flux-pro', model: 'bfl/flux-pro-1.1', settings?: ModelSettings, position: number }
 ```
 
 ### Row
@@ -115,7 +116,7 @@ Asset  (uploaded | generated) ── file on disk + thumbnail + dimensions + mim
   prompt: string,
   negativePrompt?: string,
   inputs: AssetId[],                 // reference images, in order
-  settings?: Settings,               // overrides collection defaults
+  settings?: CommonSettings,         // overrides collection defaults
   paused: boolean,
   position: number,
   notes?: string                     // free text, not part of the request
@@ -123,14 +124,25 @@ Asset  (uploaded | generated) ── file on disk + thumbnail + dimensions + mim
 ```
 
 ### Settings
-A flat bag with a small **common** vocabulary every provider understands
-(`aspectRatio`, `size`, `count`, `seed`, `outputFormat`) plus a `model` namespace
-for provider-specific knobs (`quality`, `style`, `guidance`, `steps`, ...).
-Each model declares which common keys it honors and a zod schema for its own
-keys. Unsupported keys are dropped at resolution time and the drop is recorded
-on the generation so the UI can show "seed ignored by this model".
+Two disjoint bags, owned by different things:
 
-Resolution order: `collection.defaults` ← `column.settings` ← `row.settings`.
+- **CommonSettings** (`aspectRatio`, `size`, `count`, `seed`, `outputFormat`):
+  a small vocabulary every provider understands. Owned by the **row**;
+  collection defaults fill gaps. Resolution: `collection.defaults` ← `row.settings`.
+- **ModelSettings** (`quality`, `style`, `guidance`, `steps`, ...):
+  provider-specific knobs declared by the model's zod schema. Owned by the
+  **column**; the model's registry defaults fill gaps. Rows cannot set them.
+
+The split is what keeps columns comparable: every cell in a column runs the
+same model configuration, and a row can vary the input but never quietly
+change what a column means. Validation rejects a row setting a model key or a
+column setting a common key.
+
+Each model declares which common keys it honors. An unsupported common key is
+dropped at resolution time and the drop is recorded on the generation so the
+UI can show "seed ignored by this model". Anything stronger than a dropped
+key, such as input images a model cannot take, is never dropped; the cell
+becomes `unsupported` instead (§4.1).
 
 ### Generation
 ```ts
@@ -140,10 +152,12 @@ Resolution order: `collection.defaults` ← `column.settings` ← `row.settings`
   version: 2,                        // ordinal within the cell
   requestHash: 'sha256…',            // hash of `request` below
   request: ResolvedRequest,          // full snapshot; reproducible later
-  status: 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled',
-  providerRef?: string,              // remote job handle, for resume after restart
+  status: 'queued' | 'submitting' | 'running' | 'downloading'
+        | 'succeeded' | 'failed' | 'cancelled' | 'unsupported' | 'needs_attention',
+  providerRef?: string,              // remote job handle, persisted before the first poll
+  pendingOutputs?: OutputDescriptor[], // persisted before download, so a restart re-fetches
   outputs: AssetId[],
-  error?: { message, code?, retryable },
+  error?: { message, code?, retryable },   // also carries the `unsupported` reason
   attempt: number,
   forced: boolean,                   // true = user asked for "another one"
   timing: { queuedAt, startedAt?, finishedAt? },
@@ -185,9 +199,10 @@ API only edits collections; the engine keeps live collections filled in.
 For every live collection, every non-paused row, and every column, the desired
 generation is identified by `requestHash = hash(resolve(collection, row, column))`.
 
-A cell is **satisfied** when it has a generation with that hash in status
-`queued`, `running`, or `succeeded`. Otherwise the reconciler inserts a new
-`queued` generation with that hash and a snapshot of the request.
+A cell is **satisfied** when it has a generation with that hash in any status
+other than `cancelled`. Otherwise the reconciler inserts a new generation with
+that hash and a snapshot of the request: `queued` if the row is compatible
+with the column's model, `unsupported` if not (see below).
 
 The reconciler runs:
 - after any mutation to a collection, its rows, or its columns (debounced ~200ms per collection),
@@ -206,16 +221,31 @@ Consequences that fall out for free:
   registry) are *not* part of the hash, so they never trigger regeneration.
   Only the collection's own content does.
 
-**Failed generations do not self-heal.** A failed generation counts as
-satisfying the cell until someone retries it; otherwise a broken prompt would
-burn money forever. Transient errors (429, 5xx, network) retry with backoff up
-to a small cap *inside* the runner before being marked failed.
+**Failed generations do not self-heal.** A `failed`, `unsupported`, or
+`needs_attention` generation counts as satisfying the cell until someone runs
+`cell retry`; otherwise a broken prompt would burn money forever. Transient
+errors (429, 5xx, network) on *safe-to-repeat* calls (polls, downloads,
+uploads) retry with backoff up to a small cap inside the runner before the
+generation is marked failed. Submission is repeated only when the provider
+accepts an idempotency key; a submission that times out without one becomes
+`needs_attention`, because it may have been accepted and charged.
+
+**Unsupported combinations make no request.** `resolve()` checks the row
+against the column model's capabilities: input image count, negative prompt,
+sizes and aspect ratios. An incompatible pair gets a generation in status
+`unsupported` with a specific reason in `error`, and no provider call. Other
+columns in the same row still run. Input images are never silently dropped
+and a setting the model cannot honor is never approximated. Editing the row
+or column changes the hash, so the check simply runs again.
 
 **Superseded work is cancelled.** When a row edit changes a cell's hash while
-a generation for the old hash is queued or running, the reconciler marks it
-`cancelled` (aborting the in-flight call via `AbortSignal`, and calling the
-provider's cancel endpoint if it has one). If the provider already finished,
-the output is still stored; it just is not current.
+a generation for the old hash is still in flight:
+- `queued`, not yet submitted: marked `cancelled` at once.
+- Submitted: the runner aborts its local wait via `AbortSignal` and calls the
+  adapter's `cancel()` if it has one. The generation is marked `cancelled`
+  when that confirms. A local abort is never treated as a remote cancel; if
+  the adapter has no cancel endpoint, the job is monitored to completion and
+  its output stored. It just is not current.
 
 **"Give me another one"** is the one imperative: `cell regenerate` inserts a
 new generation with the same hash and `forced: true`. Useful for
@@ -231,7 +261,7 @@ loop:
   pick queued generations, oldest first, where
     provider slots available (per-provider semaphore) and
     global slots available (global semaphore)
-  for each: mark running, spawn `execute(generation)` (not awaited)
+  for each: mark submitting (same transaction as the pick), spawn `execute(generation)` (not awaited)
   await "something changed" (new queued row, slot released), then loop
 ```
 
@@ -245,11 +275,35 @@ Concurrency limits live in config: a global cap and a per-provider cap
 (OpenAI might allow 5, a small provider 2). The `models` registry can give a
 per-model default.
 
-**Durability.** The `generations` table is the queue. On boot:
-- `queued` rows are simply picked up.
-- `running` rows with a `providerRef` are handed to the adapter's `resume()`
-  if it implements one; otherwise they are marked `failed` with a
-  `retryable: true` error and the reconciler requeues them.
+**Lifecycle.** A generation moves through persisted phases:
+
+```
+queued → submitting → running → downloading → succeeded
+```
+
+`submitting` is written before the provider call. `providerRef` is written
+through `ctx.setProviderRef` the moment the provider accepts, before the
+first poll or sleep; that write commits synchronously. `downloading` is
+written, with the provider's output descriptors in `pendingOutputs`, before
+any bytes are fetched. Each phase boundary is what makes the recovery below
+possible.
+
+**Durability.** The `generations` table is the queue. There is no exactly-once
+guarantee across a local database and a paid remote API, so recovery is
+decided by *where* the process died, and an ambiguous case is surfaced rather
+than repeated. On boot, after the reconciler has cancelled stale queued work:
+
+| Persisted state | Recovery |
+|---|---|
+| `queued` | Picked up normally. |
+| `submitting`, no `providerRef` | `needs_attention`. The request may have been accepted and charged; it is never resubmitted automatically. |
+| `running` with `providerRef`, adapter has `resume()` | `resume()` monitors the same job. `generate()` is never called again for it. |
+| `running` with `providerRef`, no `resume()` | `needs_attention`, handle kept for inspection. |
+| `downloading` | Re-fetch `pendingOutputs`; never regenerate. If the provider's URLs have expired, `failed` with a retrieval error. |
+
+A `needs_attention` generation holds no runner slot but does hold the cell
+until `cell retry` inserts a fresh one. The UI shows it distinctly from
+`failed`.
 
 This is "durable enough" for a single-user tool without a separate queue
 service. If we ever need multiple processes, the loop becomes
@@ -288,17 +342,27 @@ interface ModelSpec {
 interface GenerateContext {
   signal: AbortSignal;
   asset(id: AssetId): Promise<{ bytes: Buffer; mime: string; path: string }>;
-  setProviderRef(ref: string): Promise<void>;   // persist remote job handle ASAP
+  setProviderRef(ref: string): Promise<void>;   // persist remote job handle before the first poll/sleep
   sleep(ms: number): Promise<void>;             // abortable
   log(msg: string): void;
 }
 
+type OutputDescriptor =
+  | { url: string; mime?: string; meta?: unknown }      // runner persists, then downloads
+  | { bytes: Buffer; mime: string; meta?: unknown };    // inline; staged to data/tmp
+
 interface GenerateResult {
-  outputs: Array<{ bytes: Buffer; mime: string; meta?: unknown }>;
+  outputs: OutputDescriptor[];
   cost?: number;
   providerMeta?: unknown;
 }
 ```
+
+Adapters return descriptors, not stored assets; the runner owns persistence.
+Input images go the other way: a remote provider cannot fetch a localhost
+URL, so adapters read bytes via `ctx.asset()` and upload them or use the
+provider's attachment mechanism. Temporary provider upload handles are
+execution metadata, not part of the request snapshot.
 
 Adapters that poll do so with `ctx.sleep` and honor `signal`. A shared
 `http.ts` helper gives retry-with-backoff on 429/5xx and timeout handling so
@@ -307,14 +371,22 @@ many models in their registry; that is how we get Recraft, Ideogram, and
 friends cheaply.
 
 A **`mock` provider** ships from day one: it renders the prompt onto a colored
-image with sharp after a random delay and occasionally fails on purpose. The
+image with sharp after a random delay and occasionally fails on purpose. In
+tests it is controllable: a test can hold a generation open, complete
+generations out of order, fail one, or crash the process between phases. The
 whole UI and engine can be developed and tested without spending a cent.
 
 ### 4.4 Assets
 
-Ingest (`upload` or generation output): sniff mime, compute sha256, read
-dimensions, write `data/assets/<2-char shard>/<id>.<ext>`, write a webp
-thumbnail alongside, insert the row. Served at `/assets/:id` and
+Ingest (`upload` or generation output): stream bytes to `data/tmp/<id>`,
+sniff mime, compute sha256, read dimensions, then `rename()` into
+`data/assets/<2-char shard>/<id>.<ext>`. Same filesystem, so the rename is
+atomic. Only then insert the asset row, and for generation outputs, link the
+outputs and mark the generation `succeeded` in the same transaction. The webp
+thumbnail may be written afterwards. Originals are never overwritten, and a
+missing original is a visible storage error, not a blank cell. Files in
+`data/tmp` older than a grace period are swept on boot; a file under `assets/`
+with no row is removed by `assets gc`. Served at `/assets/:id` and
 `/assets/:id/thumb` with long cache headers, since content never changes.
 
 Dedup by sha256 is optional; an upload of an already-present file can return
@@ -371,7 +443,7 @@ The registry, grouped:
 | collections | `list`, `get` (whole grid in one document), `create`, `update`, `delete`, `pause`, `resume`, `duplicate`, `rename`, `export`, `import`, `wait` |
 | columns | `add`, `update`, `remove`, `reorder` |
 | rows | `add`, `update`, `remove`, `reorder`, `pause`, `resume`, `duplicate` |
-| cells | `get` (current + version list), `regenerate`, `retry`, `cancel` |
+| cells | `get` (current + version list), `regenerate`, `retry` (failed, unsupported, needs_attention), `cancel` |
 | generations | `get` (full request snapshot, error, timing) |
 | assets | `upload`, `get`, `list`, `label`, `gc` |
 | events | `stream` (HTTP only) |
@@ -438,3 +510,11 @@ present. The model registry is code; adding a model is adding a `ModelSpec`.
 3. `web`: collections list and grid against the mock provider.
 4. Real providers, one at a time: OpenAI, BFL, fal, Google, Replicate.
 5. MCP transport over the same command registry.
+
+**Verification.** The cases worth a test each, run against a temporary SQLite
+file and the controllable mock provider: duplicate commands; row-only and
+column-only invalidation; pause, edit several things, resume; out-of-order
+completions; edits during active runs; partial row failure; cancellation
+races; crash between `submitting` and `providerRef`; restart during polling;
+restart during download; pinned inputs surviving regeneration of their source
+cell; SSE reconnect after missed events.
