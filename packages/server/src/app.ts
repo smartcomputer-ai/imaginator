@@ -9,11 +9,14 @@ import { Reconciler } from './engine/reconciler.js';
 import { Runner } from './engine/runner.js';
 import { EventBus } from './events/bus.js';
 import { createHttpApp, type HttpApp } from './http/app.js';
+import { createMcpHttp, type McpHttp } from './mcp/http.js';
 import { buildProviders } from './providers/index.js';
 import { createServices, type EngineHooks, type Services } from './services/index.js';
 
 /** Recorded on every generation's request snapshot; never hashed. */
 export const REGISTRY_VERSION = '2026-09-09.1';
+/** Reported to MCP clients. */
+export const SERVER_VERSION = '0.1.0';
 
 export interface App {
   config: ServerConfig;
@@ -25,6 +28,7 @@ export interface App {
   reconciler: Reconciler;
   store: AssetStore;
   http: HttpApp;
+  mcp: McpHttp;
   /** Boot: reconciler boot pass → tmp sweep → runner recovery + loop. */
   start(): Promise<void>;
   /** Listen on the configured (or given) port; returns the base URL. */
@@ -53,7 +57,9 @@ export function createApp(overrides: ConfigOverrides = {}, deps: AppDeps = {}): 
   hooks.reconcileSettled = (slug) => reconciler.settled(slug);
   hooks.reconcileNow = (slug) => reconciler.runNow(slug);
   const commands = createCommandRegistry(services, registry);
-  const http = createHttpApp({ commands, services, bus, store, webDist: path.join(REPO_ROOT, 'packages', 'web', 'dist'), log: config.log });
+  let baseUrl: string | undefined;
+  const mcp = createMcpHttp({ commands, services, store, bus, version: SERVER_VERSION, baseUrl: () => baseUrl, log: config.log });
+  const http = createHttpApp({ commands, services, bus, store, mcp, webDist: path.join(REPO_ROOT, 'packages', 'web', 'dist'), log: config.log });
 
   let server: ServerType | undefined;
   let started = false;
@@ -69,6 +75,7 @@ export function createApp(overrides: ConfigOverrides = {}, deps: AppDeps = {}): 
     reconciler,
     store,
     http,
+    mcp,
 
     async start() {
       if (started) return;
@@ -82,7 +89,10 @@ export function createApp(overrides: ConfigOverrides = {}, deps: AppDeps = {}): 
 
     listen(port = config.port) {
       return new Promise<string>((resolve, reject) => {
-        server = serve({ fetch: http.fetch, port, hostname: config.host }, (info) => resolve(`http://${config.host}:${info.port}`));
+        server = serve({ fetch: http.fetch, port, hostname: config.host }, (info) => {
+          baseUrl = `http://${config.host}:${info.port}`;
+          resolve(baseUrl);
+        });
         server.once('error', reject);
       });
     },
@@ -92,6 +102,7 @@ export function createApp(overrides: ConfigOverrides = {}, deps: AppDeps = {}): 
       stopped = true;
       await runner.stop();
       await reconciler.stop();
+      await mcp.closeAll();
       http.closeStreams();
       if (server) {
         await new Promise<void>((resolve) => server!.close(() => resolve()));

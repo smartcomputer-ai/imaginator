@@ -515,8 +515,8 @@ Every operation is defined once as `{ name, input: zodSchema, output: zodSchema,
 Two thin transports are generated from that registry:
 
 - **HTTP**: `POST /api/<name>` (and a few `GET`s for reads), zod-validated.
-- **MCP**: one tool per command, schema converted from zod; read commands
-  returning images also return MCP `image` content so an agent can look at a cell.
+- **MCP**: a curated set of tools over the same registry (not one per
+  command), schema converted from zod; see §6.1.
 
 The registry, grouped:
 
@@ -535,6 +535,36 @@ The registry, grouped:
 inputs, columns with models, and for each cell the current status, asset IDs,
 thumbnail URLs, and version count. Compact enough to paste into a context
 window for a normal-sized collection.
+
+### 6.1 MCP surface
+
+The MCP server is hosted by the same process (Streamable HTTP at `/mcp`,
+serving both the 2026-07-28 revision and 2025-era sessions, plus a stdio
+bridge that forwards to it so the engine never runs twice). It is a client of
+the command registry, but it is not a 1:1 projection of it:
+
+- **Tools carry the workflow.** Agents get `create_collection` with rows and
+  columns inline, `add_rows`/`add_columns`, `update_row`/`update_column`,
+  `wait_for_collection`, `get_collection`, `get_cell`, `view_images`,
+  `regenerate_cell`/`retry_cell`/`cancel_cell`, and `upload_asset`. UI-only
+  commands (reorder, rename, duplicate, import/export, labels, gc) are HTTP
+  only. Pause/resume fold into `update_collection { status }` and
+  `update_row { paused }`.
+- **Images go inline in tool results.** That is the one path every client
+  that can show a model an image actually implements. Each image is preceded
+  by a text label with its address, because a model cannot otherwise tell
+  which image is which. `small` (<=512px webp) is the default because some
+  clients meter results by raw bytes; `full` is capped at 1568px, above
+  which vision models downscale anyway. Results also carry
+  `structuredContent` (validated against an `outputSchema`) plus the same
+  JSON as text for clients without structured output.
+- **Resources mirror the read side** (`imaginator://collections/{slug}`,
+  `imaginator://assets/{id}`, `.../thumb`, `imaginator://models`) for
+  clients that let users attach them, with `resources/subscribe` mapped to
+  the event bus. Nothing in the agent loop depends on them.
+- **`wait_for_collection` replaces push.** It long-polls on the cursor (§5)
+  and emits `notifications/progress` when the client asks; that works in
+  every client, whereas resource subscriptions and MCP tasks do not.
 
 Design rules for the command layer:
 - Accept readable addresses everywhere: `neon-cats/r3/flux-pro`, `neon-cats/r3/flux-pro#2`, plain asset IDs.

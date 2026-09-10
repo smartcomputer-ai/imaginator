@@ -36,7 +36,7 @@ pnpm typecheck        # all packages
 pnpm test             # all packages
 pnpm dev:server       # server only (tsx watch)
 pnpm dev:web          # web only
-pnpm mcp              # MCP server over stdio
+pnpm mcp              # stdio bridge to the running server's MCP endpoint (/mcp)
 ```
 
 ## API in one minute

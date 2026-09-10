@@ -10,6 +10,7 @@ import type { AssetStore } from '../assets/store.js';
 import type { CommandRegistry } from '../commands/registry.js';
 import { ServiceError } from '../errors.js';
 import type { EventBus } from '../events/bus.js';
+import type { McpHttp } from '../mcp/http.js';
 import type { Services } from '../services/index.js';
 
 export interface HttpDeps {
@@ -17,6 +18,8 @@ export interface HttpDeps {
   services: Services;
   bus: EventBus;
   store: AssetStore;
+  /** MCP endpoint, mounted at /mcp when given. */
+  mcp?: McpHttp;
   /** Directory of the built web app; served statically when it exists. */
   webDist?: string;
   log: (m: string) => void;
@@ -60,7 +63,7 @@ export function createHttpApp(deps: HttpDeps): HttpApp {
   const app = new Hono();
   const streams = new Set<() => void>();
 
-  app.use('*', cors({ origin: (origin) => origin || '*', credentials: false }));
+  app.use('*', cors({ origin: (origin) => origin || '*', credentials: false, exposeHeaders: ['Mcp-Session-Id', 'Mcp-Protocol-Version'], allowHeaders: ['Content-Type', 'Accept', 'Authorization', 'Mcp-Session-Id', 'Mcp-Protocol-Version', 'Last-Event-ID'] }));
   app.onError((e, c) => {
     if (!(e instanceof ServiceError)) deps.log(`http error ${c.req.method} ${c.req.path}: ${e.stack ?? e.message}`);
     return errorResponse(c, e);
@@ -93,6 +96,7 @@ export function createHttpApp(deps: HttpDeps): HttpApp {
       other: {
         'GET /api/health': 'liveness + bootId',
         'GET /api/events?collection=<slug>': 'server-sent events: hello, then ImaginatorEvent per line',
+        'POST|GET|DELETE /mcp': 'MCP over Streamable HTTP (tools, resources, prompts)',
         'POST /api/assets.upload (multipart/form-data: file, label?)': 'file upload alternative to the JSON form',
         'GET /assets/:id': 'original asset bytes',
         'GET /assets/:id/thumb': 'webp thumbnail',
@@ -100,6 +104,12 @@ export function createHttpApp(deps: HttpDeps): HttpApp {
       errors: '{ error: { message, code, issues? } } with 400 validation / 404 not found / 409 conflict / 500',
     });
   });
+
+  // -- MCP (Streamable HTTP) ------------------------------------------------------
+  if (deps.mcp) {
+    const mcp = deps.mcp;
+    app.all('/mcp', (c) => mcp.handle(c.req.raw));
+  }
 
   // -- SSE ------------------------------------------------------------------------
   app.get('/api/events', (c) => {
@@ -203,7 +213,7 @@ export function createHttpApp(deps: HttpDeps): HttpApp {
     };
     app.get('*', (c) => {
       const url = new URL(c.req.url);
-      if (url.pathname.startsWith('/api/') || url.pathname.startsWith('/assets/')) return c.notFound();
+      if (url.pathname.startsWith('/api/') || url.pathname.startsWith('/assets/') || url.pathname === '/mcp') return c.notFound();
       const rel = path.normalize(decodeURIComponent(url.pathname)).replace(/^(\.\.[/\\])+/, '');
       const candidate = path.join(dist, rel);
       if (candidate.startsWith(dist) && fs.existsSync(candidate) && fs.statSync(candidate).isFile()) {
