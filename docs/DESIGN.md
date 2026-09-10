@@ -566,6 +566,10 @@ the command registry, but it is not a 1:1 projection of it:
   and emits `notifications/progress` when the client asks; that works in
   every client, whereas resource subscriptions and MCP tasks do not.
 
+The client behaviour these choices rest on (which clients show the model
+tool-result images, who reads resources, size limits, protocol eras) is
+written up with sources in `docs/MCP-CLIENTS.md`.
+
 Design rules for the command layer:
 - Accept readable addresses everywhere: `neon-cats/r3/flux-pro`, `neon-cats/r3/flux-pro#2`, plain asset IDs.
 - Mutations return the updated object and the collection's cursor; no separate refetch needed.

@@ -72,14 +72,17 @@ const result = {
 };
 
 /** Routes a happy-path queue lifecycle; `statuses` is the sequence of status responses. */
-function queueServer(statuses: unknown[] = [{ status: 'IN_QUEUE', queue_position: 1 }, { status: 'IN_PROGRESS' }, { status: 'COMPLETED', metrics: { inference_time: 0.4 } }]) {
+function queueServer(
+  statuses: unknown[] = [{ status: 'IN_QUEUE', queue_position: 1 }, { status: 'IN_PROGRESS' }, { status: 'COMPLETED', metrics: { inference_time: 0.4 } }],
+  resultBody: unknown = result,
+) {
   let s = 0;
   return stubFetch(({ url, init }) => {
     if (url.startsWith('https://rest.test/storage/upload/initiate')) return json({ upload_url: 'https://upload.test/put/' + JSON.parse(init.body as string).file_name, file_url: 'https://cdn.test/' + JSON.parse(init.body as string).file_name });
     if (url.startsWith('https://upload.test/')) return new Response('', { status: 200 });
     if (init.method === 'POST' && url.startsWith('https://queue.test/fal-ai/')) return json(submitted);
     if (url === submitted.status_url) return json(statuses[Math.min(s++, statuses.length - 1)]);
-    if (url === submitted.response_url) return json(result);
+    if (url === submitted.response_url) return json(resultBody);
     return new Response('nope', { status: 404 });
   });
 }
@@ -181,6 +184,24 @@ describe('fal provider: lifecycle', () => {
     expect(out.cost).toBeCloseTo(0.003, 9);
     expect(out.providerMeta).toEqual({ endpoint: 'fal-ai/flux/schnell', requestId: 'req-1', seed: 42, prompt: 'a lighthouse', timings: { inference: 0.4 }, inferenceTime: 0.4 });
     expect(c.logs.some((l) => l.includes('IN_QUEUE (queue position 1)'))).toBe(true);
+  });
+
+  it('accepts null file metadata (flux-2-pro sends "file_size": null) and explains real shape errors', async () => {
+    // Verbatim shape of a completed fal-ai/flux-2-pro response.
+    const flux2 = {
+      images: [{ url: 'https://v3b.fal.media/files/b/0aa9d3a9/x.jpg', content_type: 'image/jpeg', file_name: 'x.jpg', file_size: null, width: 1024, height: 768 }],
+      seed: 1464247283,
+    };
+    queueServer(undefined, flux2);
+    const out = await provider.generate(req(), ctx());
+    expect(out.outputs).toEqual([{ url: 'https://v3b.fal.media/files/b/0aa9d3a9/x.jpg', mime: 'image/jpeg', meta: { width: 1024, height: 768 } }]);
+
+    vi.unstubAllGlobals();
+    queueServer(undefined, { images: [{ content_type: 'image/jpeg' }] });
+    const err = await provider.generate(req(), ctx()).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ProviderError);
+    expect((err as ProviderError).code).toBe('bad_response');
+    expect((err as ProviderError).message).toMatch(/unexpected result shape \(images\.0\.url:/);
   });
 
   it('uploads input images to fal storage before submitting', async () => {

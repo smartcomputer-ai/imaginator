@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { ID_ALPHABET, parseCellAddress, parseGenerationRef, randomId, slugify, cellAddressSchema } from '../src/ids.js';
+import { ID_ALPHABET, modelIdSchema, parseCellAddress, parseGenerationRef, randomId, slugify, cellAddressSchema } from '../src/ids.js';
 
 describe('ids', () => {
   it('random ids use the restricted alphabet', () => {
@@ -23,5 +23,14 @@ describe('ids', () => {
   it('slugify', () => {
     expect(slugify('Neon Cats!')).toBe('neon-cats');
     expect(slugify('GPT Image 1')).toBe('gpt-image-1');
+  });
+
+  it('accepts provider/model ids whose model part is a nested path', () => {
+    for (const ok of ['openai/gpt-image-1', 'fal/fal-ai/flux-pro/v1.1', 'fal/fal-ai/bytedance/seedream/v4.5/text-to-image', 'mock/fast']) {
+      expect(modelIdSchema.safeParse(ok).success, ok).toBe(true);
+    }
+    for (const bad of ['flux', 'fal/', 'fal//x', 'fal/x/', 'Fal/x', 'fal/x y', '/x']) {
+      expect(modelIdSchema.safeParse(bad).success, bad).toBe(false);
+    }
   });
 });

@@ -569,7 +569,10 @@ const statusSchema = z
   })
   .loose();
 
-const imageFileSchema = z.object({ url: z.string(), content_type: z.string().optional(), width: z.number().optional(), height: z.number().optional(), file_size: z.number().optional() }).loose();
+// fal sends `null` for metadata it does not have (flux-2-pro: `"file_size": null`), so every field but `url` is nullish.
+const imageFileSchema = z
+  .object({ url: z.string(), content_type: z.string().nullish(), width: z.number().nullish(), height: z.number().nullish(), file_size: z.number().nullish() })
+  .loose();
 const resultSchema = z
   .object({
     images: z.array(imageFileSchema).optional(),
@@ -802,15 +805,18 @@ export function createFalProvider(opts: FalOptions): Provider {
       throw toMonitorError(e, `response ${data.requestId}`);
     }
     const parsed = resultSchema.safeParse(raw);
-    if (!parsed.success) throw new ProviderError('fal: unexpected result shape', { retryable: false, code: 'bad_response' });
+    if (!parsed.success) {
+      const issues = parsed.error.issues.map((i) => `${i.path.join('.') || '$'}: ${i.message}`).join('; ');
+      throw new ProviderError(`fal: unexpected result shape (${issues})`, { retryable: false, code: 'bad_response' });
+    }
     const result = parsed.data;
     const files = result.images ?? (result.image ? [result.image] : []);
     const outputs: OutputDescriptor[] = files.map((f, i) => ({
       url: f.url,
       ...(f.content_type ? { mime: f.content_type } : {}),
       meta: {
-        ...(f.width !== undefined ? { width: f.width } : {}),
-        ...(f.height !== undefined ? { height: f.height } : {}),
+        ...(f.width != null ? { width: f.width } : {}),
+        ...(f.height != null ? { height: f.height } : {}),
         ...(result.has_nsfw_concepts?.[i] !== undefined ? { nsfw: result.has_nsfw_concepts[i]! } : {}),
       },
     }));

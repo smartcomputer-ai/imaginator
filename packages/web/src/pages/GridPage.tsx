@@ -56,8 +56,11 @@ export function GridPage() {
                   {rows.length} rows × {columns.length} columns
                 </th>
                 {columns.map((col, i) => (
-                  <th key={col.id} className="sticky top-0 z-10 border-b border-r bg-card p-0 align-top font-normal" style={{ minWidth: zoom.cellSize + 12, width: zoom.cellSize + 12 }}>
-                    <ColumnHeader slug={slug} column={col} model={modelById.get(col.model)} index={i} total={columns.length} order={columnOrder} />
+                  <th key={col.id} className="sticky top-0 z-10 border-b border-r bg-card p-0 align-top font-normal" style={{ minWidth: zoom.cellSize + 12, width: zoom.cellSize + 12, maxWidth: zoom.cellSize + 12 }}>
+                    {/* Fixed-width wrapper: the image decides the column width, long ids and model names truncate. */}
+                    <div className="overflow-hidden" style={{ width: zoom.cellSize + 12 }}>
+                      <ColumnHeader slug={slug} column={col} model={modelById.get(col.model)} index={i} total={columns.length} order={columnOrder} />
+                    </div>
                   </th>
                 ))}
                 <th className="sticky top-0 z-10 border-b bg-card p-1 align-top">

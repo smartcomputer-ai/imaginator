@@ -170,7 +170,8 @@ itself; schema violations are rejected by the SDK before the handler as
 JSON-RPC `-32602`. Tool annotations (`readOnlyHint`, `destructiveHint`, ...)
 are set on every tool.
 
-**Images: what clients actually do.** Inline `image` blocks in tool results
+**Images: what clients actually do** (full matrix with sources in
+`docs/MCP-CLIENTS.md`). Inline `image` blocks in tool results
 are the one path that reaches the model in Claude (Desktop, web, Code),
 Cursor, VS Code, Codex CLI, Gemini CLI, Zed and Cline. ChatGPT connectors drop
 image blocks (only text and `structuredContent` reach the model). Resources

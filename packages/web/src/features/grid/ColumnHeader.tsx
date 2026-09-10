@@ -40,9 +40,9 @@ export function ColumnHeader({
   const settingCount = Object.keys(column.settings ?? {}).length;
 
   return (
-    <div className="group flex h-full flex-col gap-0.5 px-1 py-1 text-left">
-      <div className="flex items-center gap-1">
-        <span className="truncate font-mono text-[12px] font-semibold" title={column.id}>
+    <div className="group flex h-full min-w-0 flex-col gap-0.5 px-1 py-1 text-left">
+      <div className="flex min-w-0 items-center gap-1">
+        <span className="min-w-0 truncate font-mono text-[12px] font-semibold" title={column.id}>
           {column.id}
         </span>
         {column.count > 1 && (
@@ -50,7 +50,7 @@ export function ColumnHeader({
             <Badge variant="secondary">×{column.count}</Badge>
           </WithTooltip>
         )}
-        <div className="ml-auto flex items-center opacity-0 transition-opacity group-hover:opacity-100 focus-within:opacity-100">
+        <div className="ml-auto flex shrink-0 items-center opacity-0 transition-opacity group-hover:opacity-100 focus-within:opacity-100">
           <WithTooltip label="Move left">
             <Button variant="ghost" size="iconSm" disabled={index === 0 || reorder.isPending} onClick={() => move(-1)}>
               <ChevronLeft />
@@ -75,13 +75,13 @@ export function ColumnHeader({
           </WithTooltip>
         </div>
       </div>
-      <div className="flex items-center gap-1">
-        <span className="truncate text-[11px] text-muted-foreground" title={column.model}>
+      <div className="flex min-w-0 items-center gap-1">
+        <span className="min-w-0 truncate text-[11px] text-muted-foreground" title={column.model}>
           {model ? model.name : column.model}
         </span>
         <Popover open={open} onOpenChange={setOpen}>
           <PopoverTrigger asChild>
-            <Button variant="ghost" size="iconSm" className="ml-auto text-muted-foreground">
+            <Button variant="ghost" size="iconSm" className="ml-auto shrink-0 text-muted-foreground">
               <Settings2 />
               {settingCount > 0 && <span className="text-[10px]">{settingCount}</span>}
             </Button>

@@ -13,7 +13,8 @@ export function randomId(length = RANDOM_ID_LENGTH, random: () => number = Math.
 export const SLUG_RE = /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/;
 export const ROW_ID_RE = /^r[1-9][0-9]*$/;
 export const RANDOM_ID_RE = new RegExp(`^[${ID_ALPHABET}]{${RANDOM_ID_LENGTH}}$`);
-export const MODEL_ID_RE = /^[a-z0-9-]+\/[a-z0-9][a-z0-9._-]*$/;
+/** `provider/model`; the model part may itself contain slashes (fal: `fal/fal-ai/flux-pro/v1.1`). */
+export const MODEL_ID_RE = /^[a-z0-9-]+\/[a-z0-9][a-z0-9._-]*(?:\/[a-z0-9][a-z0-9._-]*)*$/;
 
 export const slugSchema = z.string().regex(SLUG_RE, 'must be a lowercase slug (a-z, 0-9, hyphens)');
 export const collectionSlugSchema = slugSchema;
@@ -21,7 +22,7 @@ export const columnIdSchema = slugSchema;
 export const rowIdSchema = z.string().regex(ROW_ID_RE, 'row ids look like r1, r2, ...');
 export const assetIdSchema = z.string().regex(RANDOM_ID_RE, 'asset ids are 6 lowercase characters');
 export const generationIdSchema = z.string().regex(RANDOM_ID_RE, 'generation ids are 6 lowercase characters');
-export const modelIdSchema = z.string().regex(MODEL_ID_RE, 'model ids look like provider/model');
+export const modelIdSchema = z.string().regex(MODEL_ID_RE, 'model ids look like provider/model (the model part may contain slashes)');
 
 export type CollectionSlug = string;
 export type ColumnId = string;
