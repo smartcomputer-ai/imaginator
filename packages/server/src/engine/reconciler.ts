@@ -13,8 +13,9 @@ interface Pending {
 
 /**
  * Keeps live collections filled in (DESIGN §4.1). Debounced per collection
- * after collection/row/column events, run at once on resume/unpause and on
- * boot, never on a timer. The DB work is one transaction in the reconcile
+ * after collection/row/column events and after a generation succeeds (a cell
+ * blocked on a row reference may now resolve), run at once on resume/unpause
+ * and on boot, never on a timer. The DB work is one transaction in the reconcile
  * service; remote cancellation of superseded submitted work happens here.
  */
 export class Reconciler {
@@ -41,6 +42,8 @@ export class Reconciler {
         return;
       }
       if (e.type === 'collection.created' || e.type === 'collection.updated' || e.type.startsWith('row.') || e.type.startsWith('column.')) {
+        this.schedule(e.collection);
+      } else if (e.type === 'generation.updated' && e.status === 'succeeded') {
         this.schedule(e.collection);
       }
     });

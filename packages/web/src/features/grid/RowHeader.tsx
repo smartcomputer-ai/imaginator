@@ -1,6 +1,6 @@
 import { useState } from 'react';
-import { assetThumbUrl, INPUT_ROLES, type CommonSettings, type Input as RowInputRef, type InputRole, type Row } from '@imaginator/core';
-import { ChevronDown, ChevronUp, Copy, ImagePlus, MoreHorizontal, Pause, Play, Settings2, StickyNote, Trash2, X } from 'lucide-react';
+import { assetThumbUrl, INPUT_ROLES, isRowRef, type CommonSettings, type Input as RowInputRef, type InputRole, type Row } from '@imaginator/core';
+import { ChevronDown, ChevronUp, Copy, CornerDownRight, ImagePlus, MoreHorizontal, Pause, Play, Settings2, StickyNote, Trash2, X } from 'lucide-react';
 import { useApi, useCommand } from '@/api/queries';
 import { extractDropPayload, useUploadFiles } from '@/api/upload';
 import { AssetPicker } from '@/components/AssetPicker';
@@ -33,6 +33,7 @@ export function RowHeader({
 }) {
   const api = useApi();
   const update = useCommand('rows.update');
+  const addRows = useCommand('rows.add');
   const pause = useCommand('rows.pause');
   const resume = useCommand('rows.resume');
   const duplicate = useCommand('rows.duplicate');
@@ -61,16 +62,19 @@ export function RowHeader({
     setInputs(next);
   };
   const setRole = (i: number, role: InputRole) => {
-    const next = row.inputs.map((inp, j) => {
+    const next = row.inputs.map((inp, j): RowInputRef => {
       if (j !== i) return inp;
+      const { maskFor: _drop, ...rest } = inp;
       if (role === 'mask') {
         const target = row.inputs.findIndex((x, k) => k !== i && x.role === 'init');
-        return { asset: inp.asset, role, maskFor: Math.max(0, target) };
+        return { ...rest, role, maskFor: Math.max(0, target) };
       }
-      return { asset: inp.asset, role };
+      return { ...rest, role };
     });
     setInputs(next);
   };
+  // A follow-up row edits this row's current output, column by column.
+  const addFollowUp = () => addRows.mutate({ collection: slug, rows: [{ prompt: '', inputs: [{ row: row.id, role: 'init' }], position: index + 1 }] });
 
   const move = (delta: number) => {
     const next = [...order];
@@ -162,6 +166,9 @@ export function RowHeader({
               <DropdownMenuItem onSelect={() => duplicate.mutate({ collection: slug, row: row.id })}>
                 <Copy /> Duplicate
               </DropdownMenuItem>
+              <DropdownMenuItem onSelect={addFollowUp}>
+                <CornerDownRight /> Add follow-up row
+              </DropdownMenuItem>
               <DropdownMenuItem onSelect={() => setShowNegative(true)}>
                 <X /> Negative prompt
               </DropdownMenuItem>
@@ -240,8 +247,19 @@ export function RowHeader({
 
       <div className="mt-auto flex flex-wrap items-center gap-1 pt-0.5">
         {row.inputs.map((inp, i) => (
-          <div key={`${inp.asset}-${i}`} className="group/input relative size-10 overflow-hidden rounded border bg-muted" title={`${inp.asset} · ${inp.role}${inp.maskFor !== undefined ? ` for #${inp.maskFor}` : ''}`}>
-            <img src={assetThumbUrl(inp.asset)} alt={inp.asset} className="size-full object-cover" loading="lazy" draggable={false} />
+          <div
+            key={`${isRowRef(inp) ? inp.row : inp.asset}-${i}`}
+            className="group/input relative size-10 overflow-hidden rounded border bg-muted"
+            title={`${isRowRef(inp) ? `output of ${inp.row} in the same column` : inp.asset} · ${inp.role}${inp.maskFor !== undefined ? ` for #${inp.maskFor}` : ''}`}
+          >
+            {isRowRef(inp) ? (
+              <div className="flex size-full flex-col items-center justify-center pb-3 text-muted-foreground">
+                <CornerDownRight className="size-3" />
+                <span className="font-mono text-[10px] leading-none">{inp.row}</span>
+              </div>
+            ) : (
+              <img src={assetThumbUrl(inp.asset)} alt={inp.asset} className="size-full object-cover" loading="lazy" draggable={false} />
+            )}
             <DropdownMenu>
               <DropdownMenuTrigger asChild>
                 <button type="button" className="absolute inset-x-0 bottom-0 cursor-pointer">

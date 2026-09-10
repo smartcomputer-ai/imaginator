@@ -3,7 +3,7 @@ import { z } from 'zod';
 import type { Asset, Column, Row } from '../src/domain.js';
 import type { ModelSpec, Provider } from '../src/provider.js';
 import { ModelRegistry } from '../src/registry.js';
-import { cellHash, resolveCell } from '../src/resolve.js';
+import { cellHash, createGridResolver, referencedRows, resolveCell } from '../src/resolve.js';
 
 function spec(overrides: Partial<ModelSpec> & { id: string }): ModelSpec {
   return {
@@ -109,5 +109,55 @@ describe('resolve', () => {
     const r = registry([spec({ id: 'test/m', validateRequest: (_req, inputs) => (inputs.some((a) => a.width < 64) ? ['input too small'] : []) })]);
     const res = resolveCell(coll, { ...row, inputs: [{ asset: asset.id, role: 'reference' }] }, column, ctxFor(r));
     expect(res.unsupported).toEqual(['input too small']);
+  });
+
+  it('a row reference resolves to the upstream output and hashes like that asset input', () => {
+    const r = registry([spec({ id: 'test/m', capabilities: { inputRoles: ['init'], maxInputImages: 1, negativePrompt: false, commonKeys: [], count: 1 } })]);
+    const follow: Row = { ...row, id: 'r2', prompt: 'add a hat', inputs: [{ row: 'r1', role: 'init' }] };
+    const frozen: Row = { ...follow, inputs: [{ asset: asset.id, role: 'init' }] };
+    const resolved = resolveCell(coll, follow, column, { ...ctxFor(r), upstream: () => ({ outputs: [asset.id] }) });
+    expect(resolved.blocked).toBeUndefined();
+    expect(resolved.request.inputs).toEqual([{ asset: asset.id, role: 'init' }]);
+    expect(resolved.hash).toBe(resolveCell(coll, frozen, column, ctxFor(r)).hash);
+    expect(resolved.unsupported).toEqual([]);
+
+    const blocked = resolveCell(coll, follow, column, { ...ctxFor(r), upstream: () => ({ blocked: 'waiting for r1' }) });
+    expect(blocked.blocked).toBe('waiting for r1');
+    expect(blocked.request.inputs).toEqual([]);
+    expect(blocked.hash).not.toBe(resolved.hash);
+    const noLookup = resolveCell(coll, follow, column, ctxFor(r));
+    expect(noLookup.blocked).toBe('waiting for r1');
+    const missingOutput = resolveCell(coll, { ...follow, inputs: [{ row: 'r1', output: 2, role: 'init' }] }, column, { ...ctxFor(r), upstream: () => ({ outputs: [asset.id] }) });
+    expect(missingOutput.blocked).toBe('r1 has no output #2');
+    expect(referencedRows(follow.inputs)).toEqual(['r1']);
+  });
+
+  it('grid resolver follows references to the current generation and blocks on cycles', () => {
+    const r = registry([spec({ id: 'test/m', capabilities: { inputRoles: ['init'], maxInputImages: 1, negativePrompt: false, commonKeys: [], count: 1 } })]);
+    const base: Row = { ...row, id: 'r1' };
+    const r2: Row = { ...row, id: 'r2', prompt: 'step 2', inputs: [{ row: 'r1', role: 'init' }], position: 1 };
+    const r3: Row = { ...row, id: 'r3', prompt: 'step 3', inputs: [{ row: 'r2', role: 'init' }], position: 2 };
+    const grid = { defaults: {}, rows: [base, r2, r3], columns: [column] };
+    const baseHash = resolveCell(coll, base, column, ctxFor(r)).hash;
+    const gens: Record<string, { status: 'succeeded' | 'failed' | 'queued'; outputs: string[] }> = {};
+    const resolve = createGridResolver(grid, { ...ctxFor(r), generation: (rowId, _c, hash) => (gens[`${rowId}:${hash}`]) });
+    expect(resolve('r1', 'm').hash).toBe(baseHash);
+    expect(resolve('r2', 'm').blocked).toBe('waiting for r1');
+    expect(resolve('r3', 'm').blocked).toBe('r2: waiting for r1');
+
+    gens[`r1:${baseHash}`] = { status: 'succeeded', outputs: [asset.id] };
+    const resolve2 = createGridResolver(grid, { ...ctxFor(r), generation: (rowId, _c, hash) => gens[`${rowId}:${hash}`] });
+    const step2 = resolve2('r2', 'm');
+    expect(step2.blocked).toBeUndefined();
+    expect(step2.request.inputs[0]?.asset).toBe(asset.id);
+    expect(resolve2('r3', 'm').blocked).toBe('waiting for r2');
+    gens[`r2:${step2.hash}`] = { status: 'failed', outputs: [] };
+    expect(createGridResolver(grid, { ...ctxFor(r), generation: (rowId, _c, hash) => gens[`${rowId}:${hash}`] })('r3', 'm').blocked).toBe('r2 failed');
+
+    const loop = { ...grid, rows: [{ ...base, inputs: [{ row: 'r2', role: 'init' as const }] }, r2] };
+    const cyc = createGridResolver(loop, { ...ctxFor(r), generation: () => undefined });
+    expect(cyc('r1', 'm').blocked).toMatch(/references itself|r2: /);
+    const dangling = createGridResolver({ ...grid, rows: [r2] }, { ...ctxFor(r), generation: () => undefined });
+    expect(dangling('r2', 'm').blocked).toBe('row r1 not found');
   });
 });

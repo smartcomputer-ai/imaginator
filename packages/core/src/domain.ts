@@ -20,22 +20,45 @@ export const INPUT_ROLES = ['reference', 'init', 'mask'] as const;
 export const inputRoleSchema = z.enum(INPUT_ROLES);
 export type InputRole = (typeof INPUT_ROLES)[number];
 
-export const inputSchema = z
+const inputBase = {
+  role: inputRoleSchema,
+  /** For `mask` inputs: zero-based index of the `init` input it masks. */
+  maskFor: z.number().int().min(0).optional(),
+};
+
+function checkMask(v: { role: InputRole; maskFor?: number }, ctx: z.RefinementCtx): void {
+  if (v.role === 'mask' && v.maskFor === undefined) {
+    ctx.addIssue({ code: 'custom', message: 'a mask input must set maskFor (index of its init target)' });
+  }
+  if (v.role !== 'mask' && v.maskFor !== undefined) {
+    ctx.addIssue({ code: 'custom', message: 'only mask inputs may set maskFor' });
+  }
+}
+
+/** A fixed image: an uploaded or previously generated asset. */
+export const assetInputSchema = z.object({ asset: assetIdSchema, ...inputBase }).superRefine(checkMask);
+export type AssetInput = z.infer<typeof assetInputSchema>;
+
+/**
+ * A live reference to another row's cell *in the same column*: the current
+ * output of `row` in this column is the input. Follow-up edits chain this way
+ * (DESIGN §3, "Row references"). `output` indexes the upstream cell's outputs.
+ */
+export const rowRefInputSchema = z
   .object({
-    asset: assetIdSchema,
-    role: inputRoleSchema,
-    /** For `mask` inputs: zero-based index of the `init` input it masks. */
-    maskFor: z.number().int().min(0).optional(),
+    row: rowIdSchema,
+    output: z.number().int().min(0).optional(),
+    ...inputBase,
   })
-  .superRefine((v, ctx) => {
-    if (v.role === 'mask' && v.maskFor === undefined) {
-      ctx.addIssue({ code: 'custom', message: 'a mask input must set maskFor (index of its init target)' });
-    }
-    if (v.role !== 'mask' && v.maskFor !== undefined) {
-      ctx.addIssue({ code: 'custom', message: 'only mask inputs may set maskFor' });
-    }
-  });
+  .superRefine(checkMask);
+export type RowRefInput = z.infer<typeof rowRefInputSchema>;
+
+export const inputSchema = z.union([assetInputSchema, rowRefInputSchema]);
 export type Input = z.infer<typeof inputSchema>;
+
+export function isRowRef(input: Input): input is RowRefInput {
+  return 'row' in input;
+}
 
 export const inputsSchema = z.array(inputSchema).superRefine((inputs, ctx) => {
   inputs.forEach((input, i) => {
@@ -188,7 +211,8 @@ export const resolvedRequestSchema = z.object({
   model: modelIdSchema,
   prompt: z.string(),
   negativePrompt: z.string().optional(),
-  inputs: z.array(inputSchema),
+  /** Always asset inputs: row references are resolved to the upstream cell's output. */
+  inputs: z.array(assetInputSchema),
   count: z.number().int().min(1),
   /** Common settings after defaults and after dropping unsupported keys. */
   common: commonSettingsSchema,

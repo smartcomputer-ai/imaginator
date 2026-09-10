@@ -94,6 +94,8 @@ Typical loop:
 4. get_collection for the grid as data, then view_images (cell addresses, asset ids or generation refs) to actually look at results; get_cell for one cell with its version history.
 5. Iterate: update_row changes a prompt (only that row regenerates), regenerate_cell asks for another sample, retry_cell re-runs a failed or unsupported cell.
 
+Follow-up edits: give a row an input of { row: "r3", role: "init" } and its cell in each column edits that column's current output of r3, so a chain of edits reads top to bottom per model. Blocked cells wait for the referenced row.
+
 Addresses: cells are collection/row/column (neon-cats/r3/flux-pro), generations are collection/row/column#version or a 6-character id, assets are 6-character ids usable as row inputs (upload_asset or a previous output). Resources mirror the same data: imaginator://collections/{slug} (JSON), imaginator://assets/{id} (image) and imaginator://assets/{id}/thumb.`;
 
 // ---------------------------------------------------------------------------
@@ -440,7 +442,7 @@ export function createMcpServer(deps: McpDeps, options: McpServerOptions): McpSe
     {
       title: 'Add rows',
       description:
-        'Add one or more rows: prompt, optional negativePrompt, inputs (asset ids with roles reference/init/mask), common settings (aspectRatio, size, seed, outputFormat), notes. Each row gets a cell per column.',
+        'Add one or more rows: prompt, optional negativePrompt, inputs, common settings (aspectRatio, size, seed, outputFormat), notes. Each row gets a cell per column. An input is either a fixed asset ({ asset, role }) or a row reference ({ row: "r3", role }) meaning "the current output of row r3 in the same column": that is how a follow-up edit chains on a previous row, per model. A cell whose referenced row has no output yet is blocked until it does; when the upstream cell gets a new current version the follow-up regenerates. Roles: reference, init, mask.',
       input: z.object({ collection: collectionArg, rows: z.array(rowInputSchema).min(1) }),
       output: commandDefs['rows.add'].output,
       annotations: WRITE,
@@ -453,7 +455,7 @@ export function createMcpServer(deps: McpDeps, options: McpServerOptions): McpSe
     {
       title: 'Update row',
       description:
-        'Change a row. Only that row regenerates, and only in columns where the resolved request changed. Nullable fields set to null are cleared; inputs and settings are replaced wholesale. paused=true stops the row from generating.',
+        'Change a row. Only that row regenerates (plus rows that reference it), and only in columns where the resolved request changed. Nullable fields set to null are cleared; inputs and settings are replaced wholesale. paused=true stops the row from generating.',
       input: z.object({
         collection: collectionArg,
         row: rowIdSchema,

@@ -19,10 +19,10 @@ const RETRYABLE = new Set(['failed', 'unsupported', 'needs_attention']);
 export function GridCell({ slug, cell, size }: { slug: string; cell: CellView | undefined; size: number }) {
   if (!cell) return <div className="text-[11px] text-muted-foreground">–</div>;
   const status = cell.status;
-  const active = status !== 'missing' && isActiveStatus(status);
+  const active = status !== 'missing' && status !== 'blocked' && isActiveStatus(status);
   const thumbs = cell.thumbnails.length ? cell.thumbnails : cell.outputs.map(assetThumbUrl);
   const hasImage = status === 'succeeded' && thumbs.length > 0;
-  const tooltip = cell.error?.message;
+  const tooltip = cell.error?.message ?? cell.blocked;
   const [preview, setPreview] = useState(false);
   const timer = useRef<number | undefined>(undefined);
   useEffect(() => () => window.clearTimeout(timer.current), []);
@@ -143,7 +143,7 @@ export function CellActions({
           variant="outline"
           size={size}
           className={cls}
-          disabled={regenerate.isPending || status === 'missing'}
+          disabled={regenerate.isPending || status === 'missing' || status === 'blocked'}
           onClick={() => regenerate.mutate({ cell: address })}
         >
           <RefreshCw />

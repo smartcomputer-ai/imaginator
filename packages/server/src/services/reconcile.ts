@@ -1,9 +1,9 @@
 import { eq } from 'drizzle-orm';
-import { isActiveStatus, resolveCell } from '@imaginator/core';
+import { isActiveStatus } from '@imaginator/core';
 import { nowIso } from '../db/index.js';
 import { generations, type GenerationRow } from '../db/schema.js';
 import { assetLookupFor, insertGeneration, loadCollection, transact, type ServiceContext } from './context.js';
-import { cellKey } from './view.js';
+import { cellKey, currentOf, gridResolverFor } from './view.js';
 
 export interface ReconcileResult {
   /** New generations (queued or unsupported). */
@@ -19,14 +19,15 @@ export interface ReconcileResult {
  * For every row × column: satisfied when a non-cancelled generation with the
  * desired hash exists; otherwise insert one (live collection, unpaused row).
  * Superseded queued work is cancelled here; superseded submitted work is
- * returned for the engine to cancel remotely.
+ * returned for the engine to cancel remotely. A cell whose row-reference input
+ * has no upstream output yet is *blocked*: nothing is inserted, and a later
+ * pass (after the upstream succeeds) picks it up.
  */
 export function reconcileCollectionTx(ctx: ServiceContext, slug: string): ReconcileResult {
   return transact(ctx, (tx, emit) => {
     const result: ReconcileResult = { inserted: [], cancelled: [], superseded: [] };
     const collection = loadCollection(tx, slug);
     if (!collection) return result;
-    const assetOf = assetLookupFor(tx, collection);
 
     const all = tx.select().from(generations).where(eq(generations.collection, slug)).all();
     const byCell = new Map<string, GenerationRow[]>();
@@ -37,13 +38,14 @@ export function reconcileCollectionTx(ctx: ServiceContext, slug: string): Reconc
       if (!list) byCell.set(k, (list = []));
       list.push(g);
     }
+    const resolve = gridResolverFor(ctx, collection, byCell, assetLookupFor(tx, collection));
 
     for (const row of collection.rows) {
       for (const column of collection.columns) {
         const live = collection.status === 'live' && !row.paused;
-        const resolved = resolveCell(collection, row, column, { registry: ctx.registry, asset: assetOf });
+        const resolved = resolve(row.id, column.id);
         const gens = byCell.get(cellKey(row.id, column.id)) ?? [];
-        const satisfied = gens.some((g) => g.requestHash === resolved.hash);
+        const satisfied = !resolved.blocked && currentOf(gens, resolved.hash) !== undefined;
 
         for (const g of gens) {
           if (!isActiveStatus(g.status)) continue;
@@ -57,7 +59,7 @@ export function reconcileCollectionTx(ctx: ServiceContext, slug: string): Reconc
           }
         }
 
-        if (live && !satisfied) {
+        if (live && !satisfied && !resolved.blocked) {
           result.inserted.push(
             insertGeneration(tx, emit, {
               collection: slug,

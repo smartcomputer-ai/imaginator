@@ -1,9 +1,9 @@
-import { isActiveStatus, resolveCell, type CellAddress, type CellView, type Generation, type GenerationSummary } from '@imaginator/core';
+import { isActiveStatus, type CellAddress, type CellView, type Generation, type GenerationSummary } from '@imaginator/core';
 import type { GenerationRow } from '../db/schema.js';
 import { conflict, notFound } from '../errors.js';
 import { assetLookupFor, insertGeneration, requireCollection, toGeneration, transact, type ServiceContext } from './context.js';
 import type { GenerationService } from './generations.js';
-import { buildCellView, loadCellHistory } from './view.js';
+import { buildCellView, currentOf, gridResolverFor, loadCellGenerations, loadCellHistory } from './view.js';
 
 function summary(g: GenerationRow): GenerationSummary {
   const full = toGeneration(g);
@@ -40,9 +40,11 @@ export function createCellService(ctx: ServiceContext, gens: GenerationService) 
       if (!column) throw notFound(`column ${addr.collection}/${addr.column}`);
       if (collection.status === 'paused') throw conflict(`collection ${addr.collection} is paused`);
       if (row.paused) throw conflict(`row ${addr.collection}/${addr.row} is paused`);
-      const resolved = resolveCell(collection, row, column, { registry: ctx.registry, asset: assetLookupFor(tx, collection) });
+      const gens = loadCellGenerations(tx, addr.collection);
+      const resolved = gridResolverFor(ctx, collection, gens, assetLookupFor(tx, collection))(addr.row, addr.column);
+      if (resolved.blocked) throw conflict(`cell is blocked: ${resolved.blocked}`);
       const history = loadCellHistory(tx, addr.collection, addr.row, addr.column);
-      const current = history.find((g) => g.status !== 'cancelled' && g.requestHash === resolved.hash);
+      const current = currentOf(history, resolved.hash);
       allowed(current);
       return insertGeneration(tx, emit, {
         collection: addr.collection,
@@ -60,8 +62,9 @@ export function createCellService(ctx: ServiceContext, gens: GenerationService) 
   return {
     get(addr: CellAddress): { cell: CellView; current?: Generation; versions: GenerationSummary[]; cursor: string } {
       const { collection, row, column } = locate(addr);
+      const gens = loadCellGenerations(ctx.db, addr.collection);
       const history = loadCellHistory(ctx.db, addr.collection, addr.row, addr.column);
-      const cell = buildCellView(ctx, collection, row, column, history, assetLookupFor(ctx.db, collection));
+      const cell = buildCellView(collection, row, column, history, gridResolverFor(ctx, collection, gens, assetLookupFor(ctx.db, collection)));
       const current = cell.generation ? history.find((g) => g.id === cell.generation) : undefined;
       return {
         cell,

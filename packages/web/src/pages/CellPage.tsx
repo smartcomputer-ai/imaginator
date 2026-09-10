@@ -1,9 +1,9 @@
 import { useEffect, useState } from 'react';
 import { Link, useNavigate, useParams } from 'react-router';
-import { assetThumbUrl, assetUrl, INPUT_ROLES, isActiveStatus, type Generation, type InputRole } from '@imaginator/core';
-import { ArrowLeft, ChevronDown, ChevronLeft, ChevronRight, ChevronUp, Download, ImagePlus, Images } from 'lucide-react';
+import { assetThumbUrl, assetUrl, INPUT_ROLES, isActiveStatus, type CellView, type Generation, type InputRole } from '@imaginator/core';
+import { ArrowLeft, ChevronDown, ChevronLeft, ChevronRight, ChevronUp, CornerDownRight, Download, ExternalLink, ImagePlus, Images, X } from 'lucide-react';
 import { useEvents } from '@/api/events';
-import { useApi, useCell, useCollection, useGeneration } from '@/api/queries';
+import { useApi, useCell, useCollection, useCommand, useGeneration } from '@/api/queries';
 import { StatusBadge } from '@/components/StatusBadge';
 import { CellActions } from '@/features/grid/GridCell';
 import { Badge } from '@/components/ui/badge';
@@ -24,6 +24,7 @@ export function CellPage() {
   useEscapeTo(`/c/${slug}`);
   const cellQ = useCell(address);
   const navigate = useNavigate();
+  const addRows = useCommand('rows.add');
 
   // Neighbouring cells in grid order: ← → move across columns, ↑ ↓ across rows.
   const collectionQ = useCollection(slug);
@@ -53,12 +54,17 @@ export function CellPage() {
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [nav.left, nav.right, nav.up, nav.down, navigate]);
   const [selectedVersion, setSelectedVersion] = useState<number | undefined>();
+  // Fullscreen view of one output; stays open while arrow keys move to other cells.
+  const [lightbox, setLightbox] = useState<number | null>(null);
   const current = cellQ.data?.current;
   const versions = cellQ.data?.versions ?? [];
   const currentVersion = current?.version;
 
   // Moving to another cell drops an explicit version pick; it belonged to the previous cell.
-  useEffect(() => setSelectedVersion(undefined), [address]);
+  useEffect(() => {
+    setSelectedVersion(undefined);
+    setLightbox((l) => (l === null ? null : 0));
+  }, [address]);
 
   // Follow the current version until the user picks one explicitly.
   useEffect(() => {
@@ -85,7 +91,13 @@ export function CellPage() {
     );
   }
   const { cell } = cellQ.data;
-  const active = cell.status !== 'missing' && isActiveStatus(cell.status);
+  const active = cell.status !== 'missing' && cell.status !== 'blocked' && isActiveStatus(cell.status);
+  // A follow-up row edits this row's current output, column by column.
+  const addFollowUp = () =>
+    addRows.mutate(
+      { collection: slug, rows: [{ prompt: '', inputs: [{ row, role: 'init' }], position: rowIndex + 1 }] },
+      { onSuccess: (out) => navigate(`/c/${slug}/${out.rows[0]!.id}/${col}`) },
+    );
 
   return (
     <div className="flex h-full min-h-0 flex-col">
@@ -120,10 +132,16 @@ export function CellPage() {
         <span className="font-mono text-sm font-semibold">
           {row}/{col}
         </span>
-        <StatusBadge status={cell.status} tooltip={cell.error?.message} />
+        <StatusBadge status={cell.status} tooltip={cell.error?.message ?? cell.blocked} />
+        {cell.blocked && <span className="text-xs text-muted-foreground">{cell.blocked}</span>}
         {cell.versions > 1 && <Badge variant="secondary">{cell.versions} versions</Badge>}
         {cell.droppedKeys && cell.droppedKeys.length > 0 && <Badge variant="amber">dropped: {cell.droppedKeys.join(', ')}</Badge>}
         <div className="ml-auto flex items-center gap-1">
+          <WithTooltip label="Add a row below that edits this row's output in every column">
+            <Button variant="outline" size="sm" className="bg-card/90 shadow-sm border" disabled={addRows.isPending} onClick={addFollowUp}>
+              <CornerDownRight /> Follow up
+            </Button>
+          </WithTooltip>
           <CellActions address={address} status={cell.status} active={active} size="sm" labels />
         </div>
       </div>
@@ -131,7 +149,7 @@ export function CellPage() {
       <div className="grid min-h-0 flex-1 grid-cols-[minmax(0,1fr)_22rem] overflow-hidden">
         <div className="flex min-h-0 flex-col overflow-auto p-3">
           {generation ? (
-            <GenerationImages generation={generation} slug={slug} />
+            <GenerationImages generation={generation} slug={slug} onOpen={setLightbox} />
           ) : needsFetch && genQ.isLoading ? (
             <div className="flex items-center gap-2 text-muted-foreground">
               <Spinner /> Loading version {wantVersion}…
@@ -180,11 +198,146 @@ export function CellPage() {
           {generation ? <GenerationDetails generation={generation} /> : <p className="text-muted-foreground">Nothing to show yet.</p>}
         </aside>
       </div>
+
+      {lightbox !== null && (
+        <Lightbox
+          address={address}
+          cell={cell}
+          generation={generation}
+          loading={needsFetch && genQ.isLoading}
+          output={lightbox}
+          onOutput={setLightbox}
+          onClose={() => setLightbox(null)}
+          nav={nav}
+        />
+      )}
     </div>
   );
 }
 
-function GenerationImages({ generation, slug }: { generation: Generation; slug: string }) {
+/**
+ * Fullscreen view of one output. Arrow keys keep moving between cells (the
+ * page-level handler stays active); Escape closes the view instead of leaving
+ * the page. Clicking the backdrop closes it too.
+ */
+function Lightbox({
+  address,
+  cell,
+  generation,
+  loading,
+  output,
+  onOutput,
+  onClose,
+  nav,
+}: {
+  address: string;
+  cell: CellView;
+  generation: Generation | undefined;
+  loading: boolean;
+  output: number;
+  onOutput: (i: number) => void;
+  onClose: () => void;
+  nav: { left?: string; right?: string; up?: string; down?: string };
+}) {
+  const navigate = useNavigate();
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape' || e.defaultPrevented) return;
+      e.preventDefault();
+      onClose();
+    };
+    // Capture phase: runs before the page-level "Escape goes up" handler, which honors preventDefault.
+    window.addEventListener('keydown', onKeyDown, { capture: true });
+    return () => window.removeEventListener('keydown', onKeyDown, { capture: true });
+  }, [onClose]);
+
+  const outputs = generation?.outputs ?? [];
+  const index = Math.min(output, Math.max(0, outputs.length - 1));
+  const id = outputs[index];
+  const ghost = 'text-white hover:bg-white/10 hover:text-white';
+  const edge = 'absolute top-1/2 z-10 -translate-y-1/2 rounded-full bg-black/50 p-2 text-white hover:bg-black/70 disabled:opacity-20 cursor-pointer';
+
+  return (
+    <div role="dialog" aria-modal="true" aria-label={`${address} fullscreen`} className="fixed inset-0 z-50 flex flex-col bg-black/95 text-white" onClick={onClose}>
+      <div className="flex flex-wrap items-center gap-2 px-3 py-2 text-sm" onClick={(e) => e.stopPropagation()}>
+        <div className="flex items-center rounded-md border border-white/20">
+          <Button variant="ghost" size="iconSm" className={ghost} disabled={!nav.left} onClick={() => nav.left && navigate(nav.left)} title="Previous column (←)">
+            <ChevronLeft />
+          </Button>
+          <Button variant="ghost" size="iconSm" className={ghost} disabled={!nav.up} onClick={() => nav.up && navigate(nav.up)} title="Previous row (↑)">
+            <ChevronUp />
+          </Button>
+          <Button variant="ghost" size="iconSm" className={ghost} disabled={!nav.down} onClick={() => nav.down && navigate(nav.down)} title="Next row (↓)">
+            <ChevronDown />
+          </Button>
+          <Button variant="ghost" size="iconSm" className={ghost} disabled={!nav.right} onClick={() => nav.right && navigate(nav.right)} title="Next column (→)">
+            <ChevronRight />
+          </Button>
+        </div>
+        <span className="font-mono font-semibold">{address}</span>
+        {generation && <span className="text-white/60">v{generation.version}</span>}
+        {outputs.length > 1 && (
+          <span className="text-white/60">
+            {index + 1}/{outputs.length}
+          </span>
+        )}
+        <StatusBadge status={cell.status} tooltip={cell.error?.message ?? cell.blocked} />
+        <span className="ml-auto hidden text-xs text-white/50 md:inline">← → columns · ↑ ↓ rows · Esc close</span>
+        {id && (
+          <Button variant="ghost" size="sm" className={ghost} asChild>
+            <a href={assetUrl(id)} target="_blank" rel="noreferrer">
+              <ExternalLink /> Original
+            </a>
+          </Button>
+        )}
+        <Button variant="ghost" size="iconSm" className={ghost} onClick={onClose} title="Close (Esc)">
+          <X />
+        </Button>
+      </div>
+
+      <div className="relative min-h-0 flex-1">
+        <button type="button" className={cn(edge, 'left-3')} disabled={!nav.left} onClick={(e) => { e.stopPropagation(); if (nav.left) navigate(nav.left); }} title="Previous column (←)">
+          <ChevronLeft />
+        </button>
+        <div className="absolute inset-0 flex items-center justify-center p-4">
+          {id ? (
+            <img src={assetUrl(id)} alt={id} className="max-h-full max-w-full object-contain" onClick={(e) => e.stopPropagation()} draggable={false} />
+          ) : loading ? (
+            <div className="flex items-center gap-2 text-white/70">
+              <Spinner /> Loading…
+            </div>
+          ) : (
+            <div className="rounded-md border border-dashed border-white/30 p-8 text-center text-sm text-white/70" onClick={(e) => e.stopPropagation()}>
+              <StatusBadge status={generation?.status ?? cell.status} className="mb-2" />
+              <p>{generation?.error?.message ?? cell.blocked ?? 'No image for this cell yet.'}</p>
+            </div>
+          )}
+        </div>
+        <button type="button" className={cn(edge, 'right-3')} disabled={!nav.right} onClick={(e) => { e.stopPropagation(); if (nav.right) navigate(nav.right); }} title="Next column (→)">
+          <ChevronRight />
+        </button>
+      </div>
+
+      {outputs.length > 1 && (
+        <div className="flex justify-center gap-1.5 px-3 py-2" onClick={(e) => e.stopPropagation()}>
+          {outputs.map((o, i) => (
+            <button
+              key={o}
+              type="button"
+              className={cn('size-14 overflow-hidden rounded border border-white/20 cursor-pointer', i === index ? 'ring-2 ring-white' : 'opacity-60 hover:opacity-100')}
+              onClick={() => onOutput(i)}
+              title={o}
+            >
+              <img src={assetThumbUrl(o)} alt={o} className="size-full object-cover" draggable={false} />
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function GenerationImages({ generation, slug, onOpen }: { generation: Generation; slug: string; onOpen: (index: number) => void }) {
   if (!generation.outputs.length) {
     return (
       <div className="flex flex-1 items-center justify-center rounded-md border border-dashed p-8 text-sm text-muted-foreground">
@@ -197,15 +350,20 @@ function GenerationImages({ generation, slug }: { generation: Generation; slug: 
   }
   return (
     <div className={cn('grid gap-3', generation.outputs.length > 1 && 'grid-cols-2')}>
-      {generation.outputs.map((id) => (
+      {generation.outputs.map((id, i) => (
         <figure key={id} className="flex flex-col gap-1">
-          <a href={assetUrl(id)} target="_blank" rel="noreferrer" className="overflow-hidden rounded-md border bg-muted">
+          <button type="button" className="overflow-hidden rounded-md border bg-muted cursor-zoom-in" onClick={() => onOpen(i)} title="Open fullscreen">
             <img src={assetUrl(id)} alt={id} className="max-h-[70vh] w-full object-contain" />
-          </a>
+          </button>
           <figcaption className="flex items-center gap-1 text-[11px] text-muted-foreground">
             <span className="font-mono">{id}</span>
             <div className="ml-auto flex items-center gap-1">
               <UseAsInput assetId={id} slug={slug} />
+              <Button variant="ghost" size="xs" asChild>
+                <a href={assetUrl(id)} target="_blank" rel="noreferrer">
+                  <ExternalLink /> Original
+                </a>
+              </Button>
               <Button variant="ghost" size="xs" asChild>
                 <a href={assetUrl(id)} download={`${id}`}>
                   <Download /> Download

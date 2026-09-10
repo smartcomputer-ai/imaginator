@@ -1,5 +1,5 @@
 import { and, eq, inArray } from 'drizzle-orm';
-import { isActiveStatus, type CollectionExport, type CollectionStatus, type CollectionView, type CommonSettings, type CollectionSummary } from '@imaginator/core';
+import { isActiveStatus, isRowRef, type CollectionExport, type CollectionStatus, type CollectionView, type CommonSettings, type CollectionSummary } from '@imaginator/core';
 import { nowIso, type Tx } from '../db/index.js';
 import { collections, generations } from '../db/schema.js';
 import { conflict, invalid, notFound } from '../errors.js';
@@ -143,7 +143,7 @@ export function createCollectionService(ctx: ServiceContext) {
 
     export(slug: string): CollectionExport {
       const c = requireCollection(ctx.db, slug);
-      const assetRows = loadAssetsById(ctx.db, c.rows.flatMap((r) => r.inputs.map((i) => i.asset)));
+      const assetRows = loadAssetsById(ctx.db, c.rows.flatMap((r) => r.inputs.flatMap((i) => (isRowRef(i) ? [] : [i.asset]))));
       return {
         version: 1,
         collection: {
@@ -163,7 +163,7 @@ export function createCollectionService(ctx: ServiceContext) {
     import(document: CollectionExport, opts: { slug?: string; status?: CollectionStatus } = {}): CollectionView {
       const slug = opts.slug ?? document.collection.slug;
       transact(ctx, (tx, emit) => {
-        const needed = new Set(document.rows.flatMap((r) => r.inputs.map((i) => i.asset)));
+        const needed = new Set(document.rows.flatMap((r) => r.inputs.flatMap((i) => (isRowRef(i) ? [] : [i.asset]))));
         const found = loadAssetsById(tx, needed);
         const missing = [...needed].filter((id) => !found.has(id));
         if (missing.length > 0) throw invalid(`referenced input assets are not present locally: ${missing.join(', ')}`);

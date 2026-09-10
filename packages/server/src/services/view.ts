@@ -2,15 +2,16 @@ import { and, asc, desc, eq } from 'drizzle-orm';
 import {
   assetThumbUrl,
   assetUrl,
+  createGridResolver,
   formatCellAddress,
   isActiveStatus,
-  resolveCell,
   type Asset,
   type CellView,
   type Collection,
   type CollectionSummary,
   type CollectionView,
   type Column,
+  type ResolveResult,
   type Row,
 } from '@imaginator/core';
 import { collections, generations, type GenerationRow } from '../db/schema.js';
@@ -38,6 +39,38 @@ export function cellKey(row: string, column: string): string {
   return `${row} ${column}`;
 }
 
+/** Newest non-cancelled generation of a cell with exactly this hash; the cell's current version. */
+export function currentOf<G extends { status: string; requestHash: string; version: number }>(gens: G[] | undefined, hash: string): G | undefined {
+  let best: G | undefined;
+  for (const g of gens ?? []) {
+    if (g.status === 'cancelled' || g.requestHash !== hash) continue;
+    if (!best || g.version > best.version) best = g;
+  }
+  return best;
+}
+
+export type GridResolver = (row: string, column: string) => ResolveResult;
+
+/**
+ * Resolver for every cell of a collection. Row references read the upstream
+ * cell's current generation from `gens` (any order, any status).
+ */
+export function gridResolverFor(
+  ctx: ServiceContext,
+  collection: Collection,
+  gens: Map<string, Pick<GenerationRow, 'status' | 'requestHash' | 'version' | 'outputs'>[]>,
+  assetOf: (id: string) => Asset | undefined,
+): GridResolver {
+  return createGridResolver(collection, {
+    registry: ctx.registry,
+    asset: assetOf,
+    generation: (row, column, hash) => {
+      const g = currentOf(gens.get(cellKey(row, column)), hash);
+      return g ? { status: g.status, outputs: g.outputs } : undefined;
+    },
+  });
+}
+
 /** Newest-first generations grouped by cell. */
 export function loadCellGenerations(db: DbLike, slug: string): Map<string, CellGen[]> {
   const list = db.select(CELL_COLUMNS).from(generations).where(eq(generations.collection, slug)).orderBy(desc(generations.version)).all();
@@ -51,23 +84,17 @@ export function loadCellGenerations(db: DbLike, slug: string): Map<string, CellG
   return map;
 }
 
-export function buildCellView(
-  ctx: ServiceContext,
-  collection: Collection,
-  row: Row,
-  column: Column,
-  gens: CellGen[],
-  assetOf: (id: string) => Asset | undefined,
-): CellView {
-  const resolved = resolveCell(collection, row, column, { registry: ctx.registry, asset: assetOf });
+export function buildCellView(collection: Collection, row: Row, column: Column, gens: CellGen[], resolve: GridResolver): CellView {
+  const resolved = resolve(row.id, column.id);
   const live = gens.filter((g) => g.status !== 'cancelled');
-  const current = live.find((g) => g.requestHash === resolved.hash);
+  const current = resolved.blocked ? undefined : currentOf(live, resolved.hash);
   const view: CellView = {
     row: row.id,
     column: column.id,
     address: formatCellAddress({ collection: collection.slug, row: row.id, column: column.id }),
     hash: resolved.hash,
-    status: current ? current.status : 'missing',
+    status: current ? current.status : resolved.blocked ? 'blocked' : 'missing',
+    ...(resolved.blocked ? { blocked: resolved.blocked } : {}),
     versions: live.length,
     outputs: current?.outputs ?? [],
     urls: (current?.outputs ?? []).map(assetUrl),
@@ -92,11 +119,11 @@ export function buildCellView(
 export function buildCollectionView(ctx: ServiceContext, db: DbLike, slug: string): CollectionView {
   const collection = requireCollection(db, slug);
   const gens = loadCellGenerations(db, slug);
-  const assetOf = assetLookupFor(db, collection);
+  const resolve = gridResolverFor(ctx, collection, gens, assetLookupFor(db, collection));
   const cells: CellView[] = [];
   for (const row of collection.rows) {
     for (const column of collection.columns) {
-      cells.push(buildCellView(ctx, collection, row, column, gens.get(cellKey(row.id, column.id)) ?? [], assetOf));
+      cells.push(buildCellView(collection, row, column, gens.get(cellKey(row.id, column.id)) ?? [], resolve));
     }
   }
   let inFlight = 0;

@@ -29,7 +29,7 @@ import { commonKeySchema, commonSettingsSchema, modelSettingsSchema } from './se
 
 export const cursorSchema = z.string().describe('Per-collection change cursor; opaque');
 
-export const CELL_STATUSES = [...generationStatusSchema.options, 'missing'] as const;
+export const CELL_STATUSES = [...generationStatusSchema.options, 'missing', 'blocked'] as const;
 export const cellStatusSchema = z.enum(CELL_STATUSES);
 export type CellStatus = (typeof CELL_STATUSES)[number];
 
@@ -38,8 +38,12 @@ export const cellViewSchema = z.object({
   column: columnIdSchema,
   address: z.string().describe('collection/row/column'),
   hash: z.string().describe('Desired requestHash for this cell'),
-  /** `missing` = no generation yet for the desired hash (reconcile pending or paused). */
+  /**
+   * `missing` = no generation yet for the desired hash (reconcile pending or
+   * paused). `blocked` = a row-reference input has no output yet; see `blocked`.
+   */
   status: cellStatusSchema,
+  blocked: z.string().optional().describe('Why the cell cannot resolve yet, e.g. "waiting for r3"'),
   generation: z.string().optional().describe('Current generation id'),
   version: z.number().int().optional(),
   versions: z.number().int().describe('Non-cancelled generations in this cell, any hash'),

@@ -1,8 +1,8 @@
 import { and, asc, eq, inArray } from 'drizzle-orm';
-import { isActiveStatus, type Row, type RowInput } from '@imaginator/core';
+import { isActiveStatus, isRowRef, referencedRows, type Input, type Row, type RowInput } from '@imaginator/core';
 import type { Tx } from '../db/index.js';
 import { collections, generations, rows } from '../db/schema.js';
-import { invalid, notFound } from '../errors.js';
+import { conflict, invalid, notFound } from '../errors.js';
 import { loadAssetsById, requireCollection, requireRowRow, toRow, touchCollection, transact, type Emit, type ServiceContext } from './context.js';
 
 function orderedIds(tx: Tx, slug: string): string[] {
@@ -15,11 +15,42 @@ function renumber(tx: Tx, slug: string, order: string[]): void {
   });
 }
 
-function assertInputsExist(tx: Tx, inputs: RowInput['inputs']): void {
-  if (!inputs || inputs.length === 0) return;
-  const found = loadAssetsById(tx, inputs.map((i) => i.asset));
-  const missing = inputs.map((i) => i.asset).filter((id) => !found.has(id));
+function assertAssetsExist(tx: Tx, inputs: Input[] | undefined): void {
+  const ids = (inputs ?? []).flatMap((i) => (isRowRef(i) ? [] : [i.asset]));
+  if (ids.length === 0) return;
+  const found = loadAssetsById(tx, ids);
+  const missing = ids.filter((id) => !found.has(id));
   if (missing.length > 0) throw invalid(`input asset(s) not found: ${[...new Set(missing)].join(', ')}`);
+}
+
+/** Row id → ids it references, for every row in the collection. */
+function referenceGraph(tx: Tx, slug: string): Map<string, string[]> {
+  const list = tx.select({ id: rows.id, inputs: rows.inputs }).from(rows).where(eq(rows.collection, slug)).all();
+  return new Map(list.map((r) => [r.id, referencedRows(r.inputs)]));
+}
+
+/**
+ * Row references must point at rows of the same collection (existing, or
+ * earlier in the same batch), never at the row itself, and never form a cycle.
+ * `graph` is the collection's reference graph with this batch applied.
+ */
+function assertReferencesValid(graph: Map<string, string[]>, rowId: string, inputs: Input[] | undefined): void {
+  for (const ref of referencedRows(inputs ?? [])) {
+    if (ref === rowId) throw invalid(`row ${rowId} cannot reference itself`);
+    if (!graph.has(ref)) throw invalid(`referenced row ${ref} not found`);
+  }
+  // Walk downstream from the referenced rows; reaching rowId again is a cycle.
+  const stack = [...referencedRows(inputs ?? [])];
+  const seen = new Set<string>();
+  while (stack.length > 0) {
+    const id = stack.pop()!;
+    if (seen.has(id)) continue;
+    seen.add(id);
+    for (const next of graph.get(id) ?? []) {
+      if (next === rowId) throw invalid(`row ${rowId} and row ${id} would reference each other`);
+      stack.push(next);
+    }
+  }
 }
 
 /** Insert rows inside an existing transaction; ids come from the collection's counter. */
@@ -29,14 +60,23 @@ export function addRowsTx(tx: Tx, emit: Emit, slug: string, inputs: RowInput[], 
   let next = coll.nextRow;
   const order = orderedIds(tx, slug);
   const created: string[] = [];
-  inputs.forEach((input, i) => {
-    assertInputsExist(tx, input.inputs);
-    let id = opts.keepIds?.[i];
-    if (id) {
-      next = Math.max(next, Number(id.slice(1)) + 1);
-    } else {
-      id = `r${next++}`;
+  // Ids first, so a batch (create, import, duplicate) may reference rows within itself.
+  const ids = inputs.map((_, i) => {
+    const kept = opts.keepIds?.[i];
+    if (kept) {
+      next = Math.max(next, Number(kept.slice(1)) + 1);
+      return kept;
     }
+    return `r${next++}`;
+  });
+  const graph = referenceGraph(tx, slug);
+  inputs.forEach((input, i) => graph.set(ids[i]!, referencedRows(input.inputs ?? [])));
+  inputs.forEach((input, i) => {
+    assertAssetsExist(tx, input.inputs);
+    assertReferencesValid(graph, ids[i]!, input.inputs);
+  });
+  inputs.forEach((input, i) => {
+    const id = ids[i]!;
     const position = Math.min(input.position ?? order.length, order.length);
     tx.insert(rows)
       .values({
@@ -102,7 +142,10 @@ export function createRowService(ctx: ServiceContext) {
         if (patch.prompt !== undefined) set.prompt = patch.prompt;
         if (patch.negativePrompt !== undefined) set.negativePrompt = patch.negativePrompt;
         if (patch.inputs !== undefined) {
-          assertInputsExist(tx, patch.inputs);
+          assertAssetsExist(tx, patch.inputs);
+          const graph = referenceGraph(tx, slug);
+          graph.set(rowId, referencedRows(patch.inputs));
+          assertReferencesValid(graph, rowId, patch.inputs);
           set.inputs = patch.inputs;
         }
         if (patch.settings !== undefined) set.settings = patch.settings;
@@ -124,6 +167,12 @@ export function createRowService(ctx: ServiceContext) {
       const active = transact(ctx, (tx, emit) => {
         requireCollection(tx, slug);
         for (const id of ids) requireRowRow(tx, slug, id);
+        const removing = new Set(ids);
+        for (const [id, refs] of referenceGraph(tx, slug)) {
+          if (removing.has(id)) continue;
+          const hit = refs.find((r) => removing.has(r));
+          if (hit) throw conflict(`row ${hit} is referenced by row ${id}; change or remove that row first`);
+        }
         const activeIds = tx
           .select({ id: generations.id, status: generations.status })
           .from(generations)

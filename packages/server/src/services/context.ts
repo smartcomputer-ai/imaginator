@@ -2,6 +2,7 @@ import { and, asc, eq, inArray, sql } from 'drizzle-orm';
 import {
   assetThumbUrl,
   assetUrl,
+  isRowRef,
   randomId,
   type Asset,
   type AssetView,
@@ -164,13 +165,22 @@ export function loadAssetsById(db: DbLike, ids: Iterable<string>): Map<string, A
   return out;
 }
 
-/** Asset lookup for `resolveCell()`: every asset referenced by any row input. */
+/**
+ * Asset lookup for `resolveCell()`: every asset referenced by a row input is
+ * preloaded; anything else (row references resolve to generation outputs) is
+ * fetched on first use and cached.
+ */
 export function assetLookupFor(db: DbLike, collection: Collection): (id: string) => Asset | undefined {
-  const ids = collection.rows.flatMap((r) => r.inputs.map((i) => i.asset));
-  const map = loadAssetsById(db, ids);
+  const ids = collection.rows.flatMap((r) => r.inputs.flatMap((i) => (isRowRef(i) ? [] : [i.asset])));
+  const map = new Map<string, Asset | undefined>();
+  for (const [id, a] of loadAssetsById(db, ids)) map.set(id, toAsset(a));
+  for (const id of ids) if (!map.has(id)) map.set(id, undefined);
   return (id) => {
-    const a = map.get(id);
-    return a ? toAsset(a) : undefined;
+    if (!map.has(id)) {
+      const a = db.select().from(assets).where(eq(assets.id, id)).get();
+      map.set(id, a ? toAsset(a) : undefined);
+    }
+    return map.get(id);
   };
 }
 
