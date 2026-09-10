@@ -5,13 +5,15 @@ spreadsheet. A **collection** is a grid: rows are prompts, columns are models,
 and every cell is the picture that model made for that prompt. Cells can take
 other cells' outputs as inputs, so the grid recalculates the way a sheet does:
 change a prompt, regenerate a base image, or pin a different version, and
-everything downstream follows. Comparing models side by side, editing an image
-in a multi-turn chain, and piping one model's output through another are all
+eligible downstream cells follow. Comparing models side by side, editing an
+image in a chain, and piping one model's output through another are all
 the same mechanism.
 
 The backend keeps every live collection "filled in" by generating whatever
 cells are missing or stale. A UI and an MCP server are two clients of the same
-core API.
+core API. Recalculation can submit paid, asynchronous requests: selected
+outputs, execution controls, and visibility into cascades are part of the
+core workflow.
 
 This document covers the stack, the domain model, the generation engine, and
 the shape of the API. It deliberately does not spell out HTTP routes or MCP
@@ -42,8 +44,9 @@ reconciler (§4) needs cheap queries like "latest generation per cell", "all
 queued jobs for provider X", "which collections reference this one", and
 atomic multi-row updates. SQLite gives that with no server. We keep
 portability by adding `collection export/import` as JSON commands; a
-collection is fully described by one JSON document plus the assets it
-references.
+collection's own definitions are described by one JSON document plus its
+frozen assets. An export with cross-collection references also declares its
+external dependencies; it is not a self-contained workbook backup.
 
 **Layout**
 
@@ -89,12 +92,14 @@ and the API accepts the readable path forms everywhere an ID is expected.
 ## 3. Domain model
 
 ```
-Collection ─┬─ columns[]  (Column: model, settings, count, recipe = prompt template + inputs)
+Collection ─┬─ columns[]  (Column: model, settings, count, recipe)
             ├─ rows[]     (Row: prompt, inputs[], common settings, columns?, paused)
             └─ defaults   (common settings applied to every row unless overridden)
 
 Cell (row × column) = column recipe applied to row
-        └─ generations[]  (history; current = pinned, else newest matching)
+        ├─ pin?           (selected successful generation)
+        ├─ executionHold? (explicit cancellation for a desired hash)
+        └─ generations[]  (attempt history; current = pinned, else newest matching success)
                 └─ outputs[] → Asset
 
 Input = frozen Asset | live reference to another cell's current output
@@ -103,18 +108,22 @@ Asset (uploaded | generated) = file on disk + thumbnail + dimensions + mime
 
 The one structural rule: **a cell never carries its own prompt or inputs.**
 Every cell is a column recipe applied to a row. This is where we part from a
-spreadsheet, deliberately: rows stay comparable across models and columns
-stay comparable across prompts, and the grid remains readable however long
-the pipelines get. Everything below is built so that the simple reading,
+spreadsheet, deliberately: comparison columns apply the same row to different
+models, and stage columns apply a consistent recipe across rows. The grid is
+optimized for comparisons, parallel edit chains, and repeatable pipelines.
+Uneven branches and model-specific edits may need sparse rows or another
+collection; an arbitrary DAG is not guaranteed to read naturally as a grid.
+Everything below is built so that the simple reading,
 "rows are prompts, columns are models", stays true until you ask for more:
 
 1. Rows are prompts, columns are models. A column without a recipe is a model.
-2. "Follow up" on a cell adds a row that references the row above: a
-   multi-turn edit, one conversation per model, side by side.
+2. "Follow up" on a cell adds a row that references a source row: one
+   image-edit chain per model, side by side. It passes the selected image
+   and a new instruction, not a conversation transcript or provider session.
 3. "Use as input" can drop a frozen asset or a live reference into a row,
    optionally naming a column or another collection.
-4. A column recipe can add inputs of its own and rewrite the prompt, which
-   turns the column into a pipeline stage.
+4. A column recipe can add inputs, rewrite the prompt, and override common
+   settings, which turns the column into a pipeline stage.
 
 ### Collection
 ```ts
@@ -122,7 +131,7 @@ the pipelines get. Everything below is built so that the simple reading,
   slug: 'neon-cats',
   title: 'Neon cats',
   description?: string,
-  status: 'live' | 'paused',        // paused = edit freely, nothing generates
+  status: 'live' | 'paused',          // paused = no new provider submissions
   defaults: CommonSettings,          // aspect ratio, seed, ...
   columns: Column[],
   rows: Row[],
@@ -140,6 +149,8 @@ the pipelines get. Everything below is built so that the simple reading,
   position: number,
   prompt?: string,                   // template; default '{prompt}'
   inputs?: (Input | { rowInputs: true })[],   // default [{ rowInputs: true }]
+  common?: CommonSettingsOverride,   // per-key override; null removes an inherited key
+  negativePrompt?: string | null,    // absent inherits the row; null removes it
 }
 ```
 
@@ -148,9 +159,10 @@ capped by the model's `capabilities.count`). It lives on the column, not the
 row, because it is part of what the column *is*: a column asking for four
 samples is a different experiment from one asking for one.
 
-`prompt` and `inputs` are the column's **recipe**: how it builds a cell out
-of the row. Both default to "the row, verbatim", so a column with no recipe
-is simply a model. See "Column recipes" below.
+`prompt`, `inputs`, `common`, and `negativePrompt` are the column's
+**recipe**: how it builds a cell out of the row. All inherit the row by
+default, so a column with no recipe is simply a model. See "Column recipes"
+below.
 
 ### Row
 ```ts
@@ -211,9 +223,8 @@ What the forms are for:
 
 - **`r3` on a row** is a follow-up edit: "add a hat" under "a cat". It
   resolves per column, so the follow-up runs once per model on that model's
-  own base, and a chain of edits reads top to bottom per column. This is a
-  multi-turn conversation with each model, side by side.
-- **`r1/flux` on a row** pins one base for every model: "film grain" applied
+  own base, and a chain of edits reads top to bottom per column.
+- **`r1/flux` on a row** shares one live base across every model: "film grain" applied
   to the same Flux image by every column, to compare who styles best.
 - **`flux` on a column** makes the column a pipeline stage: "same row,
   Flux's output". See "Column recipes".
@@ -241,10 +252,19 @@ rewrites the references into it. Duplicating a row or a collection, and
 export/import, keep references as written; references into other
 collections must resolve on import.
 
+The index distinguishes written references from the effective cell edges
+after recipe expansion and sparse-row filtering. Scheduling, cycle detection,
+and impact previews use the effective graph; integrity checks also retain
+written references that a recipe currently ignores. Every structural write,
+including adding columns, changing recipes, or changing `row.columns`, checks
+the resulting graph in the same transaction. Changing a reference to another
+cell with the same asset still updates the index even when the hash stays
+the same.
+
 ### Column recipes
 
 A column is a model plus a recipe for turning the row into a request. The
-recipe has two parts and both default to "the row, verbatim":
+recipe inherits the row by default:
 
 - **`prompt`** is a template. `{prompt}` is the row's prompt, and the default
   template is `{prompt}`. A style column might use `{prompt}, woodcut print,
@@ -261,23 +281,34 @@ recipe has two parts and both default to "the row, verbatim":
   went into Flux. Making the placeholder explicit, rather than always
   appending column inputs to row inputs, is what lets follow-up rows and
   stage columns coexist without two `init` images colliding.
+- **`common`** overrides the row's effective common settings per key. For
+  example, an upscale column can set a larger `size`, while a crop stage
+  can replace `aspectRatio`. A null value removes an inherited key.
+- **`negativePrompt`** inherits when absent, replaces the row's value when
+  a string, and removes it when null. A later stage need not inherit a
+  negative prompt intended only for the base generator.
 
 A row's `maskFor` indices count within the row's inputs and are shifted by
-the placeholder's position when the recipe is expanded.
+the number of inputs before the placeholder when the recipe is expanded.
+At most one row-inputs placeholder is allowed. Column-authored `maskFor`
+indices name an explicit init entry in the column recipe, not an entry
+inside the placeholder; expansion remaps those indices too. Validation of
+the final list checks the resulting targets and roles.
 
 Reading a row left to right across stage columns is a pipeline. With
 columns `flux`, `film` (Kontext, recipe `[flux → init]`, an instruction
-template), `upscale` (recipe `[film → init]`) and `nano` (plain):
+template), `upscale` (recipe `[film → init]`) and `baseline` (a text-only
+comparison model):
 
 ```
-          flux         film             upscale           nano
-r1  cat   flux(cat)    film(r1/flux)    upscale(r1/film)  nano(cat)
-r2  ↳r1   flux(edits   film(r2/flux)    upscale(r2/film)  nano: unsupported
-            r1/flux)                                       (cannot take init)
+          flux         film             upscale           baseline
+r1  cat   flux(cat)    film(r1/flux)    upscale(r1/film)  baseline(cat)
+r2  ↳r1   flux(edits   film(r2/flux)    upscale(r2/film)  unsupported
+            r1/flux)                                    (cannot take init)
 ```
 
 Flux makes the image, Kontext adds grain to it, the upscaler finishes it,
-and Nano Banana's cell is an unrelated comparison. Row r2 is a follow-up on
+and the baseline cell is an unrelated comparison. Row r2 is a follow-up on
 r1 written the ordinary way: in `flux` it edits r1's Flux image; in `film`
 the recipe ignores the row's reference and takes r2/flux, the edited base,
 so the grain stage re-applies to the edit. "Stage" is not a concept the
@@ -285,20 +316,29 @@ engine knows. A stage is a column whose recipe references another column,
 and it waits, runs, and reruns like any cell.
 
 ### Settings
-Two disjoint bags, owned by different things:
+Two disjoint vocabularies:
 
 - **CommonSettings** (`aspectRatio`, `size`, `seed`, `outputFormat`): a
-  small shared vocabulary, supported selectively by models. Owned by the
-  **row**; collection defaults fill gaps. Resolution: `collection.defaults`
-  ← `row.settings`.
+  small shared vocabulary, supported selectively by models. Collection
+  defaults fill gaps in the row; the column recipe may then override or
+  remove individual keys. Resolution, with the rightmost value winning:
+  `collection.defaults` ← `row.settings` ← `column.common`.
 - **ModelSettings** (`quality`, `style`, `guidance`, `steps`, ...):
   provider-specific knobs declared by the model's zod schema. Owned by the
   **column**; the model's registry defaults fill gaps. Rows cannot set them.
 
-The split is what keeps columns comparable: every cell in a column runs the
-same model configuration and the same recipe, and a row can vary what goes
-in but never quietly change what a column means. Validation rejects a row
-setting a model key or a column setting a common key.
+`CommonSettingsOverride` has the same optional keys as `CommonSettings`,
+each also accepting null. Null deletes the inherited key before validation
+and hashing; it is not sent to the provider. Omission inherits. A recipe
+changing aspect ratio must also replace or remove any conflicting inherited
+size; neither key silently wins over the other.
+
+Every cell in a column runs the same model configuration and the same
+recipe. Plain comparison columns inherit the row settings unchanged; a
+stage's overrides are shown in its header/editor and resolved request.
+Validation rejects model keys in row settings or `column.common`, and
+common keys in `column.settings`. Common overrides belong to the recipe,
+not to individual cells.
 
 Each model declares which common keys it honors. An unsupported common key
 is dropped at resolution time and the drop is recorded on the generation so
@@ -308,22 +348,62 @@ cell becomes `unsupported` instead (§4.1). Invalid values for supported keys
 also make the cell `unsupported`. After dropping unsupported keys, a concrete
 `size` and `aspectRatio` must agree; neither silently overrides the other.
 
-### Current version and pins
+### Attempts, current output, and display
 
-A cell's **current** version is the newest non-cancelled generation whose
-hash matches the cell's desired hash (§4.1), unless a **pin** says
-otherwise. A pin names one generation of a cell as current. It is honored
-only while that generation's hash still equals the desired hash, so editing
-the content clears it naturally; a pin is never a way to show a stale
-picture as current.
+A cell exposes separate facts; one generation cannot stand for all of them:
 
-Pins are what make "current" yours once references exist. Regenerate a base
-three times, pin #2, and everything downstream builds on #2; regenerate more
-and nothing moves; pin #5 and the chain reruns once. A frozen asset cannot
-do this job: a row has one inputs list shared by all columns, so an asset
-means the same picture in every column, whereas a pin picks a version for
-one column and leaves the per-column references intact. Pins live on the
-source; freezing would mean editing every consumer.
+| Field | Meaning |
+|---|---|
+| `desiredHash` | Identity of the currently resolved request; absent while inputs cannot resolve or the cell is skipped. |
+| `latestAttempt` | Newest non-cancelled generation with that hash, whether active, successful, or failed. Drives attempt progress and retry controls. |
+| `current` | Selected **successful** generation with that hash: an applicable pin, otherwise the success with the greatest version ordinal. Its outputs are available to live references. |
+| `display` | `current` when present, otherwise the newest successful generation in the cell's history, marked stale and showing its provenance. Display fallback never supplies a live reference. |
+
+A regenerate starts a new attempt; it does not remove an existing matching
+success. Until a new success is selected, dependents continue using the
+existing current output. A failed regenerate leaves the working chain
+intact and shows an error alongside the image. This also means a dependent
+edited during sampling may run against the existing output and rerun after
+a new sample succeeds; use a pin to hold the output when exploring.
+
+If content changes and no matching success exists, the old image remains
+visible as stale, but dependents block until their inputs resolve. A cell
+with a failed latest attempt and a valid current success is usable as an
+input; attempt failure and input availability are separate states. Version
+ordinals, not completion times, select among successes, so a late completion
+cannot replace a newer successful version.
+
+### Pins and execution controls
+
+A **pin** names a successful generation of that cell as current and can be
+set only when its hash matches the desired hash. It applies only while that
+hash matches. A stored pin becomes inactive if the content changes or inputs
+cannot resolve, and applies again if the original hash returns; `unpin` or a
+new pin removes or replaces the choice. Inactive pins are visible in the UI.
+The resolver never mutates pins or uses a stale pinned image as an input.
+
+Regenerate a base three times, pin #2, and downstream builds on #2;
+regenerate more and nothing moves; pin #5 and eligible dependents recalculate.
+Unpin selects the newest matching success, even if a later attempt failed.
+Pins select a generation's outputs; a reference's `output` index still
+selects an image within that generation. Pins live on the source and preserve
+per-column references without editing every consumer.
+
+**Pause controls execution.** Pausing a row or collection prevents new
+provider submissions there and cancels its queued work. Already submitted
+work may finish; its successful output can still become current. A valid
+current output remains usable by live dependents, including those in another
+collection. If edits made while paused have no matching success, dependents
+block on the missing result. Resume schedules only the work still needed.
+Explicit regenerate/retry also refuse a paused target.
+
+**Pins control selection.** "Hold current output" pins the current success
+while more samples are generated. Regenerate offers `holdCurrent: true`,
+which pins the current success and inserts the attempt in one transaction;
+it requires a current success and preserves an existing applicable pin.
+Choosing a new pin or unpinning releases the new selection downstream. For
+experiments that change the source request itself, pause the consuming rows
+or collections: pins never override a changed desired hash.
 
 ### Sparse rows
 
@@ -389,37 +469,40 @@ API only edits collections; the engine keeps live collections filled in.
 
 ### 4.1 Desired state and reconciliation
 
-For every live collection, every non-paused row, and every column the row
-runs in, the desired generation is identified by
-`requestHash = hash(content(collection, row, column))`.
+For every cell the row runs in whose inputs resolve, the desired request is
+identified by `requestHash = hash(content(collection, row, column))`.
+Resolution also runs for paused rows and collections so their existing
+outputs can be read. Only live collections and non-paused rows may submit
+new work.
 
 **The hash covers what the cell asks for, not what the provider receives.**
 `content()` is:
 
 - the column's model ID, its `settings` as written, and its `count`;
-- the prompt after the column template is rendered, and the negative prompt;
+- the rendered prompt and the negative prompt after recipe overrides;
 - the ordered inputs after the column recipe is expanded, with roles and
   mask targets, where every reference is replaced by the asset ID of the
   source cell's current output;
-- the row's common settings after applying collection defaults, with keys
-  the model does not honor removed.
+- common settings after collection defaults, row settings, and column
+  overrides, with null removals applied and unhonored keys removed.
 
 Registry defaults, dropped-key records, the registry version, and anything
 else `resolve()` adds on the way to the provider are **not** hashed. They
 are recorded in the generation's `request` snapshot instead. The distinction
 is what makes the identity stable: upgrading the server or changing a
-model's default `steps` must never invalidate every cell, while any edit to
-the collection's own content must. Removing unhonored keys before hashing
-means changing a seed on a model that ignores seeds is also not an edit.
+model's default `steps` must never invalidate every cell. User edits that
+change effective content do change the hash; edits hidden by recipe
+overrides do not. Removing unhonored keys before hashing means changing a
+seed on a model that ignores seeds also leaves its hash unchanged.
 
 Templates and references are hashed by what they *resolve to*, never as
 written. A template that renders to the same text as a literal prompt, and a
 reference that resolves to the same asset as a frozen input, are the same
 content and do not rerun. This makes recipes and references safe to
 refactor, and it is why a cell's hash literally contains the picture it was
-made from. Propagation needs no notification, only recalculation: each pass
-recomputes every cell's hash and asks whether a generation with that hash
-exists.
+made from. Events schedule recalculation; each pass then recomputes hashes
+and selection from current data. No event payload decides which image a
+dependent consumes.
 
 **Resolution is workbook-wide.** The resolver for a pass is scoped to the
 reconciling collection but lazily loads any collection a reference points
@@ -428,20 +511,27 @@ a cell resolves its sources first, recursively, so a chain of any length
 resolves in one pass as far as its finished sources allow.
 
 A cell is **satisfied** when it has a generation with the desired hash in
-any status other than `cancelled`. Otherwise the reconciler inserts a new
-generation with that hash and a snapshot of the request: `queued` if the row
-is compatible with the column's model, `unsupported` if not (see below).
+any status other than `cancelled`. This only means no automatic attempt is
+needed; it does not imply success or an available output. Otherwise, if the
+scope is live and no explicit cancellation hold applies, the reconciler
+inserts a generation with that hash and a request snapshot: `queued` if
+compatible with the column's model, `unsupported` if not (see below).
 
-A cell with a reference that has nothing to resolve to is **blocked**: the
-source cell has no current generation yet, it is still running, it ended
-`failed`, `unsupported`, or `needs_attention`, it is skipped, or its
-collection is paused. A blocked cell has no desired generation, so nothing
-is inserted and the grid shows `blocked` with the reason ("waiting for r3",
-"r3 failed", "waiting for moonbase/r3/flux"). Blocking is transitive down a
-chain and clears by itself: the source succeeding is an event, and the next
-pass resolves the cell. Regenerate and retry refuse a blocked cell. A
-`skipped` cell (sparse row) is neither blocked nor missing; it is not part
-of the grid's desired state at all.
+A cell with a reference that has no usable current output is **blocked**.
+The source may be missing, skipped, awaiting its first matching success, or
+failed without a matching success. A missing output index or asset also
+blocks with a specific reason. Pausing a source alone does not block its
+valid current output; pausing one that needs work prevents that missing
+output from becoming available automatically.
+
+A blocked cell has no desired generation, so nothing is inserted. Its
+display may still show a stale historical image alongside the blocked reason
+("waiting for r3", "r3 failed", "moonbase/r3/flux needs generation but is
+paused"). Blocking is transitive and clears on recalculation when sources
+become usable, including through cached results and selection changes.
+Regenerate and retry refuse a blocked cell. A `skipped` cell is outside the
+desired state: no submission and no output available to references, even if
+it has successful history.
 
 Several generations can share one hash; they are samples of the same
 request. The hash is the identity of *what was asked*; the generation's
@@ -450,45 +540,61 @@ goes into the hash. If it did, reverting a prompt after a regenerate would
 produce a hash that matches nothing and run again, which is exactly the
 waste the hash exists to avoid.
 
-The reconciler runs:
-- after any mutation to a collection, its rows, or its columns (debounced
-  ~200ms per collection),
-- after a generation succeeds or a pin changes: for that collection, and
-  for every collection the reference index says depends on it, since a cell
-  blocked on the source may now resolve and cells referencing it now have
-  new content,
-- when a collection is resumed or a row unpaused,
-- on server boot,
-- never on a timer; there is nothing to discover that an event did not
-  announce.
+**Invalidation covers the transitive dependency closure.** Every mutation
+that can change a cell's request, selected output, availability, or progress
+dirties that cell's collection and all transitive dependent collections.
+Triggers include row/column edits, topology changes, pause/resume, pin/unpin,
+new attempts, cancellation, and every generation status transition. It is
+safe to conservatively schedule a pass when only progress changed; a
+satisfying attempt or explicit hold prevents duplicate generation.
 
-Consequences that fall out for free:
-- Edit a row → that row's cells get new generations, then whatever
-  references them, hop by hop. Rows nothing depends on are untouched.
+The reference index expands the affected closure using both old and new
+edges for structural edits. Dirty work is recorded synchronously with event
+handling, then passes are debounced ~200ms and coalesced per collection.
+Every affected collection is scheduled even if an intermediate collection
+needs no generation. For `A → B → C`, reverting A to cached output must
+recalculate B and C without waiting for a new success event from B.
+Collection-level cycles can exist in an acyclic cell graph, so closure
+traversal deduplicates collections and cell resolution follows the cell DAG.
+
+Passes read a coherent transaction snapshot and run again if new events
+dirty them. Boot dirties all collections, and recovery transitions invalidate
+their dependents too. There is no polling timer. Derived-view notifications
+acknowledge the scheduled work; they do not recursively schedule more passes
+(§5).
+
+Consequences:
+- Edit a row → cells whose effective content changes get new generations,
+  then whatever references their new outputs, hop by hop. Other rows are
+  untouched unless they depend on those changes.
 - Add a column → every row gets one new cell.
 - Revert an edit → the old hash already has a succeeded generation, so
-  nothing runs and the newest generation with that hash becomes current
-  again. Downstream cells find their old hashes too. Version history is
-  real history, and reverting a four-hop chain costs zero generations.
+  the matching selected success becomes current again. Downstream cells
+  reuse their old results when the same asset choices return. Reverting a
+  four-hop chain can cost zero generations; the hash alone cannot restore
+  a different historical sample selection.
 - Set a seed on a model that ignores seeds → no new generation, since the
   key is removed before hashing.
-- Pause, edit ten things, resume → one reconcile pass, one wave of jobs.
+- Pause, edit ten things, resume → one wave for the final desired content
+  in the paused scope. Live consumers elsewhere can still react to changes
+  that resolve to existing successes; pause those consumers to hold them too.
 - Restart → reconcile picks up where it left off.
 - Provider changes (API keys, concurrency, even model default settings in
   the registry) are *not* part of the hash, so they never trigger
   regeneration. Only the collection's own content does.
-- Regenerate a cell that other cells reference → its new sample becomes
-  current (unless the cell is pinned), so every dependent gets new content
-  and runs again, hop by hop, in whatever collection it lives. Only cells
+- Regenerate a cell that other cells reference → a successful new sample
+  becomes current (unless the cell is pinned), so dependents get new content
+  and run again, hop by hop, in whichever collections they live. Only cells
   whose resolved inputs actually changed move: regenerating r1/flux touches
-  the Flux column's chain and any stage columns fed by it, never the Nano
-  Banana column's chain. Old generations stay in history with the exact
+  the Flux column's chain and any stage columns fed by it, leaving independent
+  columns untouched. Old generations stay in history with the exact
   base they were made from.
 - Pin a version → dependents recalculate against it once; further
   regenerates of the pinned cell change nothing downstream.
 - Edit a column's template → only that column and what depends on it rerun.
-- Pause a row that others depend on → its dependents show blocked and stop,
-  which is the throttle for exploring a base without paying for its chain.
+- Pause a row → it stops submitting work; valid outputs remain usable.
+- A regenerate fails → the error is visible, the previous matching success
+  remains current, and its working downstream chain remains available.
 
 **Failed generations do not self-heal.** A `failed`, `unsupported`, or
 `needs_attention` generation counts as satisfying the cell until someone
@@ -506,11 +612,12 @@ column's `count` against the model's maximum. An incompatible pair gets a
 generation in status `unsupported` with a specific reason in `error`, and no
 provider call. Other columns in the same row still run. Input images are
 never silently dropped and a setting the model cannot honor is never
-approximated. Editing the row or column changes the hash, so the check
-simply runs again.
+approximated. An edit that changes effective content changes the hash, so
+the check runs again for that request. Retry can explicitly recheck an
+unsupported attempt after a capability or adapter change.
 
-**Superseded work is cancelled.** When a cell's hash changes while a
-generation for the old hash is still in flight:
+**Superseded work is cancelled.** When a cell's hash changes, its inputs
+become unavailable, or the cell is skipped while old work is in flight:
 - `queued`, not yet submitted: marked `cancelled` at once.
 - Submitted: call `cancel()` when a handle and that method are available,
   while keeping the result receiver alive. Only `confirmed` marks the
@@ -523,12 +630,40 @@ generation for the old hash is still in flight:
   remote cancellation; completed superseded work remains history, not the
   current cell.
 
-**"Give me another one"** is the one imperative: `cell regenerate` inserts a
-new generation with the same hash and `forced: true`. Useful for
-non-deterministic models. With a seed set on a model that honors it, a
+**"Give me another one"**: `cell regenerate` inserts a new generation with
+the same hash and `forced: true`. Useful for non-deterministic models.
+With a seed set on a model that honors it, a
 regenerate legitimately returns the same image; a user who wants variety
-clears the seed. `cell pin` and `cell unpin` change which version is current
-and therefore what dependents see; they never touch the hash.
+clears the seed. Retry applies to the latest failed, unsupported, or
+needs-attention attempt, even if a prior success remains current, and can
+release an explicit cancellation hold. `cell pin` and `cell unpin` change
+selection without changing the source's request hash; dependent hashes change
+only when the selected input assets change.
+
+An explicit `cell cancel` also records an execution hold for that cell's
+desired hash, so cancellation-triggered reconciliation cannot immediately
+recreate the cancelled work. Queued attempts for that hash are cancelled;
+submitted attempts follow the remote cancellation rules above.
+Regenerate/retry or a different concrete desired hash clears the hold;
+pause/resume alone does not. Cancellation for supersession or pause does not
+create this user hold. A matching successful output, if
+present, stays usable. These controls are cell metadata, never request
+content and never part of the hash.
+
+**Cascade visibility ships with live dependencies.** `cells impact` is a
+read-only preview of a proposed regenerate, retry, pin, or unpin. It reports
+potentially affected cell addresses and collections, the direct/transitive
+counts, and existing controls such as paused scopes and applicable source
+pins. The UI shows this footprint beside the action and offers "hold current
+output" for sampling. Pausing consuming rows or collections holds their
+execution without pausing the source.
+
+The preview uses the effective graph and current state. Unknown future
+output assets mean it describes potential work, not an exact run count or
+price; caches and controls can reduce it, and concurrent edits can change it.
+A downstream pin is not automatically a stopping point: changed inputs can
+make its hash no longer match. Provider concurrency limits bound simultaneous
+work, not total cost. Price estimates and hard budgets can follow later.
 
 ### 4.2 The runner
 
@@ -539,7 +674,8 @@ loop:
   pick queued generations, oldest first, where
     provider slots available (per-provider semaphore) and
     global slots available (global semaphore)
-  for each: mark submitting (same transaction as the pick), spawn `execute(generation)` (not awaited)
+  for each: service revalidates eligibility, then marks submitting in the same transaction
+            spawn `execute(generation)` (not awaited)
   await "something changed" (new queued row, slot released), then loop
 ```
 
@@ -549,6 +685,10 @@ the loop; every provider wait is an `await` on `fetch` or `setTimeout`. With
 a few dozen in-flight generations the process is idle almost all the time,
 since the real work happens at the provider. The runner knows nothing about
 references: by the time a generation is queued, its inputs are asset IDs.
+The service that claims queued work checks that the request is still desired,
+its inputs are usable, and its scope is live and not held. This prevents a
+debounced invalidation or pause from letting obsolete queued work submit.
+Once marked submitting, remote cancellation follows the lifecycle rules.
 
 Concurrency limits live in config: a global cap and a per-provider cap
 (OpenAI might allow 5, a small provider 2). The `models` registry can give a
@@ -582,9 +722,10 @@ stale queued work:
 | `running` with `providerRef`, no `resume()` | `needs_attention`, handle kept for inspection. |
 | `downloading` | Reuse staged files or fetch `pendingOutputs` URLs; never regenerate. Missing files or expired URLs become `failed` with a retrieval error. |
 
-A `needs_attention` generation holds no runner slot but does hold the cell
-until `cell retry` inserts a fresh one. The UI shows it distinctly from
-`failed`.
+A `needs_attention` generation holds no runner slot and prevents automatic
+retry until `cell retry` inserts a fresh attempt. A prior matching success
+can still be current and usable. The UI shows the ambiguous attempt
+distinctly from `failed`.
 
 This is "durable enough" for a single-user tool without a separate queue
 service. If we ever need multiple processes, the loop becomes
@@ -703,15 +844,22 @@ function that (1) runs one SQLite transaction, (2) emits events after commit.
 Nothing writes to the DB outside services. Events:
 
 ```
-collection.created | .updated | .deleted        { slug }
+collection.created | .updated | .deleted        { collection }
+collection.invalidated | .reconciled            { collection }
 row.updated | row.deleted                       { collection, row }
 column.updated | column.deleted                 { collection, column }
+cell.updated                                    { collection, row, column }  // pins and execution holds
 generation.updated                              { id, collection, row, column, status }
 asset.created                                   { id }
 ```
 
-Events carry IDs, not payloads. Consumers refetch what they need; that keeps
-the bus trivial and makes it impossible for a client to see a stale payload.
+Events carry IDs, not document payloads. Consumers refetch a coherent view
+of the latest state. The originating write schedules the affected closure
+and emits `collection.invalidated` for its collections, including those
+whose own rows were not edited. Each completed pass emits
+`collection.reconciled`, even if it only restored cached selections or
+updated blocked reasons and inserted no generations. These derived events
+refresh consumers and advance cursors; they never feed back into invalidation.
 
 Every event also carries a **cursor**: a per-collection counter that
 increments on each event, alongside a server boot ID. `collections get` and
@@ -722,26 +870,70 @@ cursor from a previous boot is treated as stale and any wait on it returns
 at once.
 
 Consumers:
-- **Reconciler** subscribes to collection/row/column events, and to
-  `generation.updated` with status `succeeded` and to pin changes, fanning
-  out to dependent collections through the reference index.
+- **Reconciler** subscribes to source mutations and generation transitions
+  and schedules the transitive closure described in §4.1. It ignores the
+  derived invalidated/reconciled events as scheduling inputs.
 - **Runner** subscribes to `generation.updated` (status `queued`) to wake up.
 - **SSE endpoint** forwards events to browsers, optionally filtered by
   collection. The UI invalidates the matching TanStack Query keys and
   refetches; a grid of a few hundred cells refetches in one request. On
   reconnect the UI simply refetches; there is no replay log, since a refetch
   is the recovery.
-- **MCP** does not get a push channel by default (most agents cannot consume
-  one). Instead the command layer offers `collection wait { cursor, timeout }`:
-  return as soon as the collection's cursor is past the given one, or when
-  the timeout elapses. The response carries the new cursor and whether any
-  generations are still queued or in flight. Waiting on a cursor rather than
-  on "nothing is running" matters because of the reconcile debounce: right
-  after an edit, nothing is queued yet, and an idle check would return
-  immediately with stale results. An agent's loop is "mutate (get cursor) →
-  wait(cursor) → get, repeat while in flight". If a client supports MCP
-  resource subscriptions we can map collection resources to the same events
-  later; nothing in the core changes.
+- **MCP** uses `collection wait { cursor, timeout }`: return after the
+  collection's cursor advances and the currently dirty work affecting its
+  view has reconciled, or when the timeout elapses. On timeout, pending
+  reconciliation remains visible in the returned progress; it cannot be
+  mistaken for settlement. The collection view and wait response expose
+  the same dependency-aware progress contract below.
+
+### Collection progress and waiting
+
+Local `queued` and `inFlight` counts remain useful diagnostics, but they
+cannot establish that a collection is settled. A collection may have no local jobs while an
+upstream collection generates its inputs. Conversely, a superseded remote
+attempt may still be monitored without being able to change the desired
+results.
+
+`progress` is computed for the collection's included cells and the upstream
+work that can affect them, across collections. It answers one question,
+"will anything else happen on its own?", and keeps that separate from
+"did every cell succeed?":
+
+| State | Meaning |
+|---|---|
+| `running` | Relevant work is queued, active, runnable, or awaiting reconciliation, locally or in a prerequisite collection. Some branches may already be blocked or failed. |
+| `blocked` | Nothing can advance automatically, and at least one included cell is waiting on a *dependency* that cannot become available without intervention: its source has no usable success (failed, unsupported, needs attention), is paused while needing work, was explicitly cancelled, or is skipped. |
+| `settled` | Nothing can advance automatically and no included cell is waiting on a dependency. Every cell is either successful or terminal in its own right. |
+
+A cell that is itself `failed`, `unsupported`, or `needs_attention` is
+**terminal, not blocked**. Unsupported cells are an expected outcome of a
+comparison grid (a text-only column given an init image), and a failed
+first attempt is a fact about that cell, not about its dependencies. Such
+cells never keep a collection out of `settled`; they appear in the
+response's `attention` lists (`failed`, `unsupported`, `needsAttention`,
+each with addresses and messages) alongside a separate list of newer failed
+attempts on cells that still have an older matching success. "Every desired
+output exists" is therefore `settled` with empty attention lists, and the
+response says so directly as `allSucceeded`.
+
+Responses also include `pendingReconcile`, upstream queued/in-flight counts,
+and structured blocking reasons with source addresses. Work behind an
+applicable pin that cannot change the selected output does not keep its
+consumers running. Non-superseded attempts for included cells in the
+requested collection itself count as running even under a pin: those
+samples are local work the user requested. Superseded attempts remain
+visible in diagnostic counts without delaying settlement.
+
+An agent's loop is "mutate (get cursor) → wait(cursor) → inspect, repeat
+while progress is running". On `blocked`, report or address the listed
+sources; do not wait forever for an event that needs user intervention. On
+`settled`, read the attention lists: empty means every desired output is
+available; otherwise the grid is as done as it will get and the listed
+cells need a retry, a row change, or acceptance. Dependency-only changes
+wake a waiter and refresh a collection-filtered SSE client even when the
+requested collection has no generation event of its own. Counts and
+progress are read from one coherent snapshot after the relevant passes,
+rather than inferred from the last event's payload.
 
 ---
 
@@ -762,16 +954,18 @@ The registry, grouped:
 | collections | `list`, `get` (whole grid in one document), `create`, `update`, `delete`, `pause`, `resume`, `duplicate`, `rename`, `export`, `import`, `wait` |
 | columns | `add`, `update` (model, settings, count, recipe), `remove`, `reorder` |
 | rows | `add`, `update` (prompt, inputs, settings, columns), `remove`, `reorder`, `pause`, `resume`, `duplicate` |
-| cells | `get` (current, version list, precedents and dependents), `regenerate`, `retry` (failed, unsupported, needs_attention), `cancel`, `pin`, `unpin` |
+| cells | `get` (current, latest attempt, display, versions, precedents and dependents), `impact`, `regenerate` (optional hold-current), `retry` (failed, unsupported, needs_attention attempt or explicit cancellation hold), `cancel`, `pin`, `unpin` |
 | generations | `get` (full request snapshot, error, timing) |
 | assets | `upload`, `get`, `list`, `label`, `gc` |
 | events | `stream` (HTTP only) |
 
 `collections get` is the document an LLM works from: rows with prompts and
-inputs, columns with models and recipes, and for each cell the current
-status, asset IDs, thumbnail URLs, version count, and the blocked reason
-when there is one. Compact enough to paste into a context window for a
-normal-sized collection.
+inputs, columns with models and recipes, and for each cell the desired hash,
+current successful output, latest-attempt status/error, display provenance
+and stale marker, pin state, execution hold, version count, and blocked
+reason when present. Asset IDs and thumbnail URLs identify the images.
+The document includes the dependency-aware progress from §5 and stays compact
+enough for an agent working with a normal-sized collection.
 
 Design rules for the command layer:
 - Accept readable addresses everywhere: `neon-cats/r3/flux-pro`,
@@ -781,6 +975,10 @@ Design rules for the command layer:
   object form.
 - Mutations return the updated object and the collection's cursor; no
   separate refetch needed.
+- `cells impact` accepts the proposed action and selection, uses the same
+  resolver and dependency graph as execution, and returns its read-only
+  footprint with observed collection cursors. It is a preview, not a
+  reservation or approval gate; execution validates against current state.
 - Bulk-friendly: `rows add` accepts an array so an agent can create ten
   prompts in one call, and rows in one batch may reference each other.
 - Nothing about generation is imperative except `regenerate`, `retry`,
@@ -797,13 +995,14 @@ of the command registry, but it is not a 1:1 projection of it:
 - **Tools carry the workflow.** Agents get `create_collection` with rows and
   columns inline, `add_rows`/`add_columns`, `update_row`/`update_column`,
   `wait_for_collection`, `get_collection`, `get_cell`, `view_images`,
-  `regenerate_cell`/`retry_cell`/`cancel_cell`/`pin_cell`, and
-  `upload_asset`. UI-only commands (reorder, rename, duplicate,
+  `regenerate_cell`/`retry_cell`/`cancel_cell`/`pin_cell`/`unpin_cell`,
+  `preview_cell_impact`, and `upload_asset`. UI-only commands (reorder, rename, duplicate,
   import/export, labels, gc) are HTTP only. Pause/resume fold into
   `update_collection { status }` and `update_row { paused }`. Tool
-  descriptions explain references and recipes in one sentence each, since
-  an agent chaining edits or building a pipeline needs only the address
-  grammar.
+  descriptions explain reference addresses, recipe inheritance, successful
+  selection versus latest attempts, pin versus pause, and the progress
+  states. Agents get the same cascade preview and hold-current option as
+  the UI.
 - **Images go inline in tool results.** That is the one path every client
   that can show a model an image actually implements. Each image is
   preceded by a text label with its address, because a model cannot
@@ -817,8 +1016,9 @@ of the command registry, but it is not a 1:1 projection of it:
   clients that let users attach them, with `resources/subscribe` mapped to
   the event bus. Nothing in the agent loop depends on them.
 - **`wait_for_collection` replaces push.** It long-polls on the cursor (§5)
-  and emits `notifications/progress` when the client asks; that works in
-  every client, whereas resource subscriptions and MCP tasks do not.
+  and returns dependency-aware progress, emitting `notifications/progress`
+  when requested. The workflow does not depend on resource subscriptions
+  or MCP tasks.
 
 The client behaviour these choices rest on (which clients show the model
 tool-result images, who reads resources, size limits, protocol eras) is
@@ -829,20 +1029,26 @@ written up with sources in `docs/MCP-CLIENTS.md`.
 ## 7. UI shape
 
 Routes:
-- `/` collections list with status, cell counts, in-flight counts.
+- `/` collections list with execution status, cell counts, and progress,
+  including waiting on another collection or blocked on an intervention.
 - `/c/:slug` the grid. Row header = prompt (inline editable), inputs as
   thumbnails (a reference shows as an address chip, `↳ r3`), settings
   popover, pause toggle, "add follow-up row". Column header = model,
   settings popover, and a `← flux` marker when the column's recipe
-  references another column, so a pipeline is readable off the headers.
-  Cell = current image or status badge (queued / running / failed / blocked
-  / skipped), click for detail. Collection header = live/paused toggle,
-  defaults, add column (model picker driven by the registry), add row.
+  references another column, plus explicit common-setting overrides.
+  Cell = current image with attempt progress/error, or a stale historical
+  image with the missing/blocked reason, or an empty/skipped cell. Pins and
+  execution holds are visible; click for detail. Collection header =
+  live/paused toggle, defaults, add column (model picker driven by the
+  registry), add row.
 - `/c/:slug/:row/:col` cell detail: large view with a fullscreen mode that
-  keeps arrow-key navigation between cells, version strip with pin, the
-  resolved request, error or blocked reason, regenerate, "follow up", "use
+  keeps arrow-key navigation between cells, version strip distinguishing
+  current output and latest attempt, pin/unpin, the resolved request, error
+  or blocked reason, regenerate with "hold current output", "follow up", "use
   as input" (frozen asset, or a live reference with optional column and
-  collection), and the cell's precedents and dependents as links.
+  collection), and the cell's precedents and dependents as links. Generation
+  and selection actions show the potential cascade footprint, including
+  affected collections, and link to the consuming rows' pause controls.
 - `/assets` library: uploads and generated, filter, label, drag onto rows.
 
 The features layer so the basics stay untouched. Rows are prompts and
@@ -850,9 +1056,11 @@ columns are models; nothing else is visible until asked for. "Follow up" on
 a cell is the first reference anyone meets. "Use as input" is where absolute
 and cross-collection references appear, next to the frozen asset. The
 column editor keeps the recipe in a collapsed section showing `{prompt}` and
-a single "row inputs" chip, which is the default recipe spelled out; adding
-a column reference there makes a stage. A user who never opens it never sees
-any of this.
+a single "row inputs" chip, inherited common settings, and an inherited
+negative prompt. Adding a column reference makes a stage. Overrides become
+visible once set; ordinary comparison columns keep the simple editor. Pause
+is labeled as stopping new submissions, and a pin as holding the selected
+output, so those controls do not imply the same effect.
 
 Editing commits on blur/enter, not per keystroke, so a reconcile pass happens
 once per edit. The grid reads from one query per collection and invalidates
@@ -874,10 +1082,12 @@ present. The model registry is code; adding a model is adding a `ModelSpec`.
   optional status, numeric progress, and preview callbacks to
   `GenerateContext`; queue status is not an image preview, and previews are
   not final outputs.
-- Video: `Asset.kind` and `ModelSpec.kind` already allow it; a video adapter
-  and a `<video>` cell renderer are the work.
-- Cost tracking beyond the optional per-generation number, and a preview of
-  what a regenerate or pin will cascade into before it runs.
+- Video: `Asset.kind` and `ModelSpec.kind` reserve the distinction. Video
+  still needs request capabilities, duration/frame metadata, input
+  validation, adapters, storage limits, and playback.
+- Cost estimates, accounting beyond the per-generation number, and hard
+  execution budgets. Dependency footprints and sampling controls ship with
+  references rather than waiting for accurate pricing.
 - "Paste values": turn a reference into the asset it currently resolves to.
 - Dependency highlighting in the grid (precedents and dependents on hover).
 - Multi-process runner (lease column, see §4.2).
@@ -885,8 +1095,17 @@ present. The model registry is code; adding a model is adding a `ModelSpec`.
   cover the pipeline case; row-level variables may be an agent's job via
   MCP.
 - Cells whose output is text rather than an image: a prompt-writing model as
-  a column, referenced by an image row as its prompt. The reference model
-  already allows it; the asset kind and a text renderer are the work.
+  a column, referenced by another cell as its prompt. This requires typed
+  outputs, references into prompt fields, conversion/validation rules, and
+  request hashing for those values. The current image-input reference model
+  does not provide it merely by adding an asset kind and renderer.
+- Native conversational generation: retaining message history or provider
+  session state requires an explicit context model and immutable context
+  snapshots. Image-edit chains do not promise that behavior.
+- Self-contained workbook export/import, including dependency closure,
+  generation history, selected versions, and asset files. The initial
+  collection export declares external references and requires them to exist
+  on import.
 - Auth. Localhost tool.
 
 ---
@@ -902,19 +1121,30 @@ present. The model registry is code; adding a model is adding a `ModelSpec`.
 5. MCP transport over the same command registry.
 6. Same-column row references (`r3` on a row), blocked cells, and the
    reconciler pass on succeeded generations.
-7. **General references.** Optional column and collection anchors on row
-   references, the reference index, the workbook resolver, cross-collection
-   invalidation, cycle detection on the concrete cell graph, delete refusal
-   and rename rewriting, partial-address parsing in the command layer, the
-   live-reference option in "use as input", precedents and dependents on the
-   cell page.
-8. **Pins and sparse rows.** `cell pin`/`unpin` with the hash-match rule and
-   its invalidation; `row.columns` and the `skipped` cell status.
-9. **Column recipes.** `column.prompt` templates and `column.inputs` with
-   the row-inputs placeholder; the recipe section in the column editor; the
-   stage marker in column headers.
+7. **Selection and execution contracts, pins, and sparse rows.** Separate
+   latest attempt, current success, and display fallback; specify pause and
+   explicit cancellation holds; revalidate queued submissions. Add pin/unpin
+   with hash-scoped applicability, atomic hold-current sampling, `row.columns`,
+   and skipped cells. Cover every relevant transition in local invalidation,
+   expose dependency-aware progress, and ship cascade previews and controls
+   for the existing same-column chains.
+8. **Same-collection recipes and references.** Column anchors on row
+   references, partial-address parsing, and column recipes with prompt/input
+   expansion, common overrides, and negative-prompt inheritance. Maintain the
+   reference index and effective cell graph, validate cycles and deletion,
+   and extend impact previews to stages. Add the recipe editor, stage and
+   override markers, and precedent/dependent links.
+9. **Cross-collection references.** Full addresses, a workbook resolver,
+   transitive invalidation using old/new edges, dependent collection cursors
+   and SSE, and waiting across prerequisites. Add cross-collection cycle
+   checks, delete refusal, rename rewriting, explicit export dependencies,
+   and cross-collection impact previews before enabling live external links.
 
-Steps 1 to 6 are built. Each remaining step is usable on its own.
+Steps 1 to 6 have an initial implementation. Step 7 changes its latest-attempt
+selection behavior and completes the execution and progress contracts above;
+these are target semantics, not claims that all are already implemented.
+Each remaining step is usable on its own. Pins and local pipelines precede
+the global dependency-management work.
 
 **Verification.** The cases worth a test each, run against a temporary
 SQLite file and the controllable mock provider:
@@ -933,19 +1163,59 @@ SQLite file and the controllable mock provider:
   invalid input/mask combinations make no provider call.
 - References: a follow-up row runs after its base on the base output of the
   same column; regenerating a base cascades down its column only; a
-  follow-up is blocked while its base is missing, failed, or paused and
-  fills once it succeeds; a queued follow-up is superseded when its base
+  follow-up is blocked while its base has no usable success and fills once
+  one becomes available; a queued follow-up is superseded when its base
   changes mid-flight; reference validation (unknown, self, cycle, removal
   of a referenced row); an absolute reference feeds the same picture to
-  every column; a reference into another collection follows that
-  collection's regenerations and blocks while it is paused; a
-  cross-collection cycle is refused; renaming a collection keeps references
-  into it working; reverting a base finds the whole old chain with no runs.
-- Pins and sparse rows: a pin holds dependents still across regenerates and
-  clears when the content changes; a skipped cell costs nothing and blocks
-  its dependents with a reason.
+  every column; an external reference follows selected successes across
+  collections; a cross-collection cell cycle is refused; an acyclic cell
+  graph with collection-level cycles resolves and invalidates without loops;
+  renaming keeps references working; restoring the same selected assets
+  finds the old downstream chain with no runs; an asset-equivalent reference
+  rewrite updates dependency tracking without generating.
+- Selection: a failed regenerate preserves a previous matching success and
+  its downstream chain while exposing the attempt error; changed content
+  shows a stale image without exposing it as a live input; late completion
+  cannot replace a newer success; retry targets the failed latest attempt
+  even when a successful output is current.
+- Pins and sparse rows: only matching successes can be pinned; a pin holds
+  dependents still across regenerates; it becomes inactive on a different or
+  unresolved hash and applies again on revert; unpin selects the newest
+  matching success despite a later failed attempt; hold-current and attempt
+  insertion are atomic; a skipped cell costs nothing and blocks its
+  dependents despite historical outputs.
+- Execution controls: pausing an already successful source preserves usable
+  outputs; editing it while paused blocks dependents only when no matching
+  success exists; pausing consumers stops their queued work while the source
+  remains live; submitted work can finish after pause; explicit cancellation
+  is not automatically recreated on invalidation or restart; retry releases
+  the cancellation hold; a queued claim cannot submit after a pause, skip,
+  hold, or upstream edit made before its claim transaction.
+- Invalidation and waiting: an A → B → C revert across collections restores
+  cached results without any new success events; pause/resume, pin/unpin,
+  failure, cancellation, and restart recovery reach all affected views;
+  derived notifications do not form an event loop; SSE filtered to a
+  dependent collection and its cursor waiter observe upstream-only changes;
+  zero local jobs with an active upstream reports running; an upstream
+  failure without usable output reports blocked with that source listed; a
+  plain failed or unsupported cell with no dependents reports settled with
+  the cell in the attention lists, never blocked; a successful cached
+  closure reports settled with empty attention lists and `allSucceeded`;
+  sampling a pinned source keeps its own collection running without keeping
+  an external consumer running; a timeout during reconciliation never
+  reports settled; unrelated or superseded remote work does not delay
+  settlement.
 - Recipes: a stage column runs after its source column in the same row and
   ignores the row's inputs; a follow-up row under a stage column re-applies
   the stage to the edited base; a template and a literal that render the
   same text share a hash; editing a template reruns only that column and
-  its dependents.
+  its dependents; common overrides follow precedence and null removal;
+  conflicting inherited size/aspect ratio is rejected without approximation;
+  negative-prompt removal reaches the request; row and column mask targets
+  remap correctly; adding a column or changing a sparse row/recipe cannot
+  introduce a cycle through previously inactive references.
+- Cascade previews: effective dependencies exclude discarded row inputs;
+  affected collections and paused scopes are shown; source hold-current
+  sampling has no selection cascade; a dependent pin invalidated by changed
+  inputs is not mistaken for a propagation barrier; previews make no writes
+  or provider calls and label unknown output effects as potential work.
