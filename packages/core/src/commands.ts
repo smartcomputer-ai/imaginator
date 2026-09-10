@@ -49,6 +49,7 @@ export const cellViewSchema = z.object({
   error: generationErrorSchema.optional(),
   droppedKeys: z.array(commonKeySchema).optional(),
   timing: generationTimingSchema.optional(),
+  cost: z.number().optional().describe('Estimated USD of the current generation'),
 });
 export type CellView = z.infer<typeof cellViewSchema>;
 
@@ -84,6 +85,7 @@ export const modelInfoSchema = z.object({
   provider: z.string(),
   kind: z.enum(['image', 'video']),
   description: z.string().optional(),
+  pricing: z.string().optional().describe('Human-readable list price; per-generation cost is estimated from it'),
   capabilities: z.object({
     inputRoles: z.array(z.string()),
     maxInputImages: z.number().int(),

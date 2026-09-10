@@ -195,6 +195,8 @@ export function RowHeader({
       <InlineTextarea
         value={row.prompt}
         placeholder="Prompt…"
+        maxRows={4}
+        saveNote="changes regenerate this row"
         onCommit={(prompt) => update.mutate({ collection: slug, row: row.id, prompt })}
       />
 
@@ -205,6 +207,8 @@ export function RowHeader({
             value={row.negativePrompt ?? ''}
             placeholder="Negative prompt…"
             rows={1}
+            maxRows={2}
+            saveNote="changes regenerate this row"
             autoFocus={showNegative && !row.negativePrompt}
             className="text-xs text-muted-foreground"
             onCommit={(v) => {
@@ -222,6 +226,8 @@ export function RowHeader({
             value={row.notes ?? ''}
             placeholder="Notes (not part of the request)"
             rows={1}
+            maxRows={2}
+            saveNote="notes never regenerate anything"
             autoFocus={showNotes && !row.notes}
             className="text-xs italic text-muted-foreground"
             onCommit={(v) => {

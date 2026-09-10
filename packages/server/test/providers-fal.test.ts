@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ModelRegistry, ProviderError, resolveCell, type Asset, type Column, type GenerateContext, type ProviderRef, type ResolvedRequest, type Row } from '@imaginator/core';
-import { createFalProvider, FAL_MODELS, buildInput, sizeFields } from '../src/providers/fal.js';
+import sharp from 'sharp';
+import { createFalProvider, FAL_MODELS, buildInput, describeFalPricing, estimateFalCost, refDataOf, sizeFields } from '../src/providers/fal.js';
 
 const PNG = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 1, 2, 3]);
 const assets: Record<string, Asset> = {
@@ -166,6 +167,67 @@ describe('fal provider: input mapping', () => {
   });
 });
 
+describe('fal provider: pricing', () => {
+  const FLUX2_PRO = 'fal/fal-ai/flux-2-pro';
+  const FLUX2_EDIT = 'fal/fal-ai/flux-2-pro/edit';
+  const IDEOGRAM = 'fal/fal-ai/ideogram/v3';
+  const BANANA2 = 'fal/fal-ai/nano-banana-2';
+  const MP = 1024 * 1024;
+
+  it('every model carries a price and a label', () => {
+    for (const m of provider.models) expect(m.pricing, m.id).toMatch(/^\$|^per image by/);
+    expect(registry.get(SCHNELL)!.pricing).toBe('$0.003 per megapixel');
+    expect(registry.get(RECRAFT)!.pricing).toBe('$0.04 per image');
+    expect(registry.get(IDEOGRAM)!.pricing).toBe('per image by rendering_speed: TURBO $0.03, BALANCED $0.06, QUALITY $0.09');
+    expect(registry.get(BANANA2)!.pricing).toMatch(/4K \$0.16; \+\$0.002 with thinking_level high$/);
+    expect(describeFalPricing(def(FLUX2_PRO).pricing)).toBe('$0.03 for the first output megapixel, $0.015 per extra megapixel of input and output');
+  });
+
+  it('estimates flat, per-megapixel, per-setting and FLUX.2 pro prices', () => {
+    expect(estimateFalCost(def(RECRAFT).pricing, { settings: {}, outputPixels: [MP] })).toBe(0.04);
+    expect(estimateFalCost(def(ULTRA).pricing, { settings: {}, outputPixels: [MP, MP] })).toBe(0.12);
+    // Megapixels round up per image; 1024x1024 is exactly one.
+    expect(estimateFalCost(def(SCHNELL).pricing, { settings: {}, outputPixels: [1024 * 768] })).toBe(0.003);
+    expect(estimateFalCost(def(QWEN).pricing, { settings: {}, outputPixels: [1920 * 1080, MP] })).toBe(0.06);
+    expect(estimateFalCost(def(QWEN).pricing, { settings: {}, outputPixels: [MP, undefined] })).toBeUndefined();
+    expect(estimateFalCost(def(QWEN).pricing, { settings: {}, outputPixels: [] })).toBeUndefined();
+    // Tiers come from the resolved settings; the default tier covers a missing key.
+    expect(estimateFalCost(def(IDEOGRAM).pricing, { settings: { rendering_speed: 'QUALITY' }, outputPixels: [MP, MP] })).toBe(0.18);
+    expect(estimateFalCost(def(IDEOGRAM).pricing, { settings: {}, outputPixels: [MP] })).toBe(0.06);
+    expect(estimateFalCost(def(BANANA2).pricing, { settings: { resolution: '4K', thinking_level: 'high' }, outputPixels: [MP] })).toBe(0.162);
+    expect(estimateFalCost(def('fal/fal-ai/nano-banana-pro').pricing, { settings: { resolution: '2K' }, outputPixels: [MP] })).toBe(0.15);
+    // FLUX.2 pro: first output megapixel, then input + output megapixels together.
+    expect(estimateFalCost(def(FLUX2_PRO).pricing, { settings: {}, outputPixels: [MP], inputPixels: [] })).toBe(0.03);
+    expect(estimateFalCost(def(FLUX2_PRO).pricing, { settings: {}, outputPixels: [1920 * 1080], inputPixels: [] })).toBe(0.045);
+    expect(estimateFalCost(def(FLUX2_EDIT).pricing, { settings: {}, outputPixels: [MP], inputPixels: [MP] })).toBe(0.045);
+    expect(estimateFalCost(def(FLUX2_EDIT).pricing, { settings: {}, outputPixels: [MP] })).toBeUndefined();
+  });
+
+  it('measures FLUX.2 edit inputs, records the pricing context on the handle, and prices the result', async () => {
+    const png = await sharp({ create: { width: 1024, height: 1024, channels: 3, background: '#123456' } }).png().toBuffer();
+    const calls = queueServer(undefined, { images: [{ url: 'https://fal.media/files/e.jpg', content_type: 'image/jpeg', width: 1024, height: 1024 }] });
+    const c = ctx();
+    c.asset = async () => ({ bytes: new Uint8Array(png), mime: 'image/png', path: '/x/a1' });
+    const out = await provider.generate(req({ model: FLUX2_EDIT, inputs: [{ asset: 'a1', role: 'init' }], common: { size: '1024x1024' } }), c);
+    expect(calls.some((x) => x.url.startsWith('https://upload.test/'))).toBe(true);
+    expect(refDataOf(c.refs[0]!).pricing).toEqual({ settings: {}, outputPixels: 1024 * 1024, inputPixels: [1024 * 1024] });
+    expect(out.cost).toBe(0.045);
+  });
+
+  it('prices a resumed request from the handle when the response has no dimensions', async () => {
+    queueServer(undefined, { images: [{ url: 'https://fal.media/files/r.jpg' }] });
+    const ref = { version: 1, model: SCHNELL, data: { endpoint: 'fal-ai/flux/schnell', requestId: 'req-1', statusUrl: submitted.status_url, responseUrl: submitted.response_url, cancelUrl: submitted.cancel_url, count: 1, pricing: { settings: {}, outputPixels: 1920 * 1080 } } };
+    const out = await provider.resume!(ref, ctx());
+    expect(out.cost).toBe(0.006);
+    // A handle from before pricing was recorded prices nothing rather than guessing.
+    vi.unstubAllGlobals();
+    queueServer(undefined, { images: [{ url: 'https://fal.media/files/r.jpg' }] });
+    const { pricing: _dropped, ...legacyData } = ref.data;
+    const legacy = { ...ref, data: legacyData };
+    expect((await provider.resume!(legacy, ctx())).cost).toBeUndefined();
+  });
+});
+
 describe('fal provider: lifecycle', () => {
   it('submits, commits the handle, polls to completion, and returns remote outputs', async () => {
     const calls = queueServer();
@@ -176,7 +238,7 @@ describe('fal provider: lifecycle', () => {
     expect((calls[0]!.init.headers as Record<string, string>).Authorization).toBe('Key fal-test');
     expect(JSON.parse(calls[0]!.init.body as string)).toMatchObject({ prompt: 'a lighthouse', seed: 42 });
     expect(c.refs).toHaveLength(1);
-    expect(c.refs[0]).toEqual({ version: 1, model: SCHNELL, data: { endpoint: 'fal-ai/flux/schnell', requestId: 'req-1', statusUrl: submitted.status_url, responseUrl: submitted.response_url, cancelUrl: submitted.cancel_url, count: 1 } });
+    expect(c.refs[0]).toEqual({ version: 1, model: SCHNELL, data: { endpoint: 'fal-ai/flux/schnell', requestId: 'req-1', statusUrl: submitted.status_url, responseUrl: submitted.response_url, cancelUrl: submitted.cancel_url, count: 1, pricing: { settings: {}, outputPixels: 1024 * 768, inputPixels: [] } } });
     // submit, 3 status polls, 1 response fetch; the handle was committed before the first poll.
     expect(calls.map((x) => x.url)).toEqual(['https://queue.test/fal-ai/flux/schnell', submitted.status_url, submitted.status_url, submitted.status_url, submitted.response_url]);
 

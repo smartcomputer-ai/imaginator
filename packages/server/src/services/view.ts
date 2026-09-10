@@ -29,6 +29,7 @@ const CELL_COLUMNS = {
   queuedAt: generations.queuedAt,
   startedAt: generations.startedAt,
   finishedAt: generations.finishedAt,
+  cost: generations.cost,
 } as const;
 
 export type CellGen = Pick<GenerationRow, keyof typeof CELL_COLUMNS>;
@@ -76,6 +77,7 @@ export function buildCellView(
     view.generation = current.id;
     view.version = current.version;
     if (current.error) view.error = current.error;
+    if (current.cost !== null && current.cost !== undefined) view.cost = current.cost;
     view.timing = {
       queuedAt: current.queuedAt,
       ...(current.startedAt ? { startedAt: current.startedAt } : {}),

@@ -1,9 +1,12 @@
 {
   "name": "imaginator",
   "private": true,
+  "license": "Apache-2.0",
   "version": "0.1.0",
   "packageManager": "pnpm@10.15.1",
-  "engines": { "node": ">=22" },
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
     "build": "pnpm -r --filter ./packages/core --filter ./packages/server --filter ./packages/web run build",
     "typecheck": "pnpm -r run typecheck",

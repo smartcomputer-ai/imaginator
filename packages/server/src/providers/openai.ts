@@ -281,6 +281,7 @@ function specFor(def: OpenAIModelDef): ModelSpec {
       ...(def.customSizes ? {} : { sizes: [...PRESET_SIZES], aspectRatios: Object.keys(PRESET_BY_RATIO) }),
     },
     settings: settingsFor(def),
+    pricing: describePricing(def.price),
     validateRequest: (req, inputs) => validateRequestFor(def, req, inputs),
   };
 }
@@ -355,6 +356,15 @@ const responseSchema = z
     usage: usageSchema.optional(),
   })
   .loose();
+
+/** Output image tokens for a 1024x1024 image at medium and high quality (OpenAI's published token table). */
+const REFERENCE_IMAGE_TOKENS = { medium: 1056, high: 4160 } as const;
+
+/** One-line price for model pickers: the token rate plus what a square image costs at medium and high quality. */
+export function describePricing(price: OpenAIModelDef['price']): string {
+  const per = (tokens: number) => `$${((tokens * price.imageOut) / 1_000_000).toFixed(3).replace(/0+$/, '').replace(/\.$/, '')}`;
+  return `$${price.imageOut} per 1M output tokens (about ${per(REFERENCE_IMAGE_TOKENS.medium)} to ${per(REFERENCE_IMAGE_TOKENS.high)} per 1024x1024 image, medium to high); cost is computed from reported usage`;
+}
 
 /** USD estimate from token usage at the model's list prices. */
 export function estimateCost(usage: Usage | undefined, price: OpenAIModelDef['price']): number | undefined {

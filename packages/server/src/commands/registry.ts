@@ -36,6 +36,7 @@ function modelInfo(registry: ModelRegistry): ModelInfo[] {
       provider: providerIdOf(spec.id),
       kind: spec.kind,
       ...(spec.description !== undefined ? { description: spec.description } : {}),
+      ...(spec.pricing !== undefined ? { pricing: spec.pricing } : {}),
       capabilities: { ...spec.capabilities },
       settingsSchema: settingsSchema as ModelInfo['settingsSchema'],
       settingsDefaults: registry.defaultsFor(spec.id) as ModelInfo['settingsDefaults'],

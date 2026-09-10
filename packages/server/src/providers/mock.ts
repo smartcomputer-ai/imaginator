@@ -309,6 +309,8 @@ function validateImages(inputs: Asset[]): string[] {
   return errors;
 }
 
+const MOCK_PRICING = '$0.001 per image (pretend; nothing is charged)';
+
 function textOnly(id: string, name: string, extra: Partial<ModelSpec> = {}): ModelSpec {
   return {
     id,
@@ -317,6 +319,7 @@ function textOnly(id: string, name: string, extra: Partial<ModelSpec> = {}): Mod
     capabilities: { inputRoles: [], maxInputImages: 0, negativePrompt: false, commonKeys: ['aspectRatio', 'seed', 'outputFormat'], count: 4, outputFormats: ['png', 'jpeg', 'webp'] },
     validateRequest: () => [],
     settings: mockSettings,
+    pricing: MOCK_PRICING,
     ...extra,
   };
 }
@@ -337,6 +340,7 @@ const img2img: ModelSpec = {
   name: 'Mock Img2Img',
   kind: 'image',
   description: 'Tints the init image and overlays the prompt. Accepts init, mask, reference.',
+  pricing: MOCK_PRICING,
   capabilities: { inputRoles: ['init', 'mask', 'reference'], maxInputImages: 3, negativePrompt: true, commonKeys: ['aspectRatio', 'seed', 'outputFormat'], count: 4, outputFormats: ['png', 'jpeg', 'webp'] },
   settings: mockSettings,
   validateRequest(req, inputs) {

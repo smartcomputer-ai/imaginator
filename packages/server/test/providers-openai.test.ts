@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ModelRegistry, ProviderError, resolveCell, type Asset, type Column, type GenerateContext, type ResolvedRequest, type Row } from '@imaginator/core';
-import { createOpenAIProvider, OPENAI_MODELS, buildParams, estimateCost, orderInputs, sizeForRatio, validateCustomSize } from '../src/providers/openai.js';
+import { createOpenAIProvider, OPENAI_MODELS, buildParams, describePricing, estimateCost, orderInputs, sizeForRatio, validateCustomSize } from '../src/providers/openai.js';
 
 const PNG = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 1, 2, 3]);
 const JPG = new Uint8Array([0xff, 0xd8, 0xff, 9, 8, 7]);
@@ -260,6 +260,11 @@ describe('openai provider: generate', () => {
     const pending = provider.generate(req(), c);
     controller.abort(new Error('cancelled by test'));
     await expect(pending).rejects.toThrow('cancelled by test');
+  });
+
+  it('describes the price for model pickers', () => {
+    expect(describePricing({ textIn: 5, imageIn: 8, imageOut: 30 })).toBe('$30 per 1M output tokens (about $0.032 to $0.125 per 1024x1024 image, medium to high); cost is computed from reported usage');
+    for (const m of createOpenAIProvider({ apiKey: 'k' }).models) expect(m.pricing).toMatch(/per 1M output tokens/);
   });
 
   it('estimates cost per model price table', () => {

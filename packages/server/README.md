@@ -23,6 +23,22 @@ Config comes from env (`.env` at the repo root is loaded by `main.ts`):
 when no real key is present. `createApp(overrides)` in `src/app.ts` boots the
 same thing programmatically (tests use it with a temp data dir).
 
+## Cost estimates
+
+No provider returns a price, so every generation's `cost` is an estimate made
+by the adapter and stored on the generation. It is shown on the cell page, per
+cell in `collections.get`, and summed per column and per collection in the grid.
+
+| Provider | How |
+|---|---|
+| `openai` | Token usage from the response × the per-million-token list prices in `OPENAI_MODELS`. Missing usage → no cost. |
+| `fal` | Each `FalModelDef` declares its endpoint's list price (`pricing`): flat per image, per output megapixel (1024×1024 = 1 MP, rounded up per image), per image by a settings tier (Nano Banana `resolution`, Ideogram `rendering_speed`), or the FLUX.2 pro rule (first output megapixel + every extra megapixel of input and output). The settings, the requested output size and, for FLUX.2 pro, the measured input sizes are recorded on the provider handle so a resumed request is priced too. Unknown dimensions → no cost rather than a guess. |
+| `mock` | $0.001 per image, never charged. |
+
+`models.list` carries a human-readable `pricing` line per model. Prices are
+copied from the providers' pages by hand; when a provider changes them, update
+the table in the adapter.
+
 ## Browsing the API
 
 `GET /api` (e.g. http://localhost:4747/api) returns every command with its

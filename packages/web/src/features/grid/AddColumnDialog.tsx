@@ -84,6 +84,7 @@ export function AddColumnDialog({ slug, open, onOpenChange, existingIds }: { slu
                       {m.kind === 'video' && <Badge variant="violet">video</Badge>}
                     </div>
                     {m.description && <div className="text-xs text-muted-foreground">{m.description}</div>}
+                    {m.pricing && <div className="text-[11px] tabular-nums text-muted-foreground">{m.pricing}</div>}
                     <div className="flex flex-wrap gap-1">
                       <Badge variant="outline">{m.capabilities.inputRoles.length ? `inputs: ${m.capabilities.inputRoles.join(', ')} (≤${m.capabilities.maxInputImages})` : 'text only'}</Badge>
                       {m.capabilities.negativePrompt && <Badge variant="outline">neg prompt</Badge>}

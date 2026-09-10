@@ -1,3 +1,4 @@
+import sharp from 'sharp';
 import { z } from 'zod';
 import {
   ProviderError,
@@ -85,6 +86,135 @@ type ImageInputMode =
   /** `image_urls: string[]`. */
   | { kind: 'multi'; field: string; max: number };
 
+// ---------------------------------------------------------------------------
+// Pricing
+// ---------------------------------------------------------------------------
+
+/**
+ * fal publishes one list price per endpoint; the response carries no usage or
+ * charge, so cost is estimated from the price and what we know about the
+ * request. A "megapixel" is 1024x1024 px (fal bills a 1024x1024 image as one),
+ * rounded up per image.
+ */
+export type FalPricing =
+  /** Flat rate per output image. */
+  | { kind: 'per_image'; usd: number }
+  /** Per output megapixel, rounded up per image. */
+  | { kind: 'per_megapixel'; usd: number }
+  /** Flat rate per image chosen by one settings value (resolution tier, rendering speed), plus optional flat surcharges. */
+  | { kind: 'per_image_by_setting'; setting: string; usd: Record<string, number>; default: string; surcharges?: { setting: string; value: string; usd: number }[] }
+  /** FLUX.2 pro: one rate for the first output megapixel, another for every extra megapixel of input and output. */
+  | { kind: 'flux2_pro'; firstMegapixel: number; extraMegapixel: number };
+
+export const MEGAPIXEL = 1024 * 1024;
+
+const FLUX2_PRO_PRICING: FalPricing = { kind: 'flux2_pro', firstMegapixel: 0.03, extraMegapixel: 0.015 };
+
+export interface FalCostInput {
+  /** Resolved model settings (registry defaults filled in). */
+  settings: Record<string, unknown>;
+  /** Pixel count of each output image; undefined when unknown. */
+  outputPixels: (number | undefined)[];
+  /** Pixel counts of the input images, when known (only some prices need them). */
+  inputPixels?: number[];
+}
+
+function megapixels(pixels: number): number {
+  return Math.max(1, Math.ceil(pixels / MEGAPIXEL));
+}
+
+function roundUsd(usd: number): number {
+  return Math.round(usd * 1_000_000) / 1_000_000;
+}
+
+/** USD estimate for one fal request, or undefined when something the price depends on is unknown. */
+export function estimateFalCost(pricing: FalPricing, input: FalCostInput): number | undefined {
+  const n = input.outputPixels.length;
+  if (n === 0) return undefined;
+  switch (pricing.kind) {
+    case 'per_image':
+      return roundUsd(pricing.usd * n);
+    case 'per_megapixel': {
+      let mp = 0;
+      for (const px of input.outputPixels) {
+        if (px === undefined) return undefined;
+        mp += megapixels(px);
+      }
+      return roundUsd(pricing.usd * mp);
+    }
+    case 'per_image_by_setting': {
+      const raw = input.settings[pricing.setting];
+      const key = typeof raw === 'string' ? raw : pricing.default;
+      const perImage = pricing.usd[key] ?? pricing.usd[pricing.default];
+      if (perImage === undefined) return undefined;
+      let extra = 0;
+      for (const s of pricing.surcharges ?? []) if (input.settings[s.setting] === s.value) extra += s.usd;
+      return roundUsd((perImage + extra) * n);
+    }
+    case 'flux2_pro': {
+      const inputs = input.inputPixels;
+      if (inputs === undefined) return undefined;
+      const inputPx = inputs.reduce((a, b) => a + b, 0);
+      let usd = 0;
+      for (const px of input.outputPixels) {
+        if (px === undefined) return undefined;
+        usd += pricing.firstMegapixel + pricing.extraMegapixel * (megapixels(px + inputPx) - 1);
+      }
+      return roundUsd(usd);
+    }
+  }
+}
+
+function fmtUsd(usd: number): string {
+  return `$${usd.toFixed(4).replace(/0+$/, '').replace(/\.$/, '')}`;
+}
+
+/** One-line description of a price for model pickers. */
+export function describeFalPricing(pricing: FalPricing): string {
+  switch (pricing.kind) {
+    case 'per_image':
+      return `${fmtUsd(pricing.usd)} per image`;
+    case 'per_megapixel':
+      return `${fmtUsd(pricing.usd)} per megapixel`;
+    case 'per_image_by_setting': {
+      const tiers = Object.entries(pricing.usd).map(([k, v]) => `${k} ${fmtUsd(v)}`).join(', ');
+      const extra = (pricing.surcharges ?? []).map((s) => `; +${fmtUsd(s.usd)} with ${s.setting} ${s.value}`).join('');
+      return `per image by ${pricing.setting}: ${tiers}${extra}`;
+    }
+    case 'flux2_pro':
+      return `${fmtUsd(pricing.firstMegapixel)} for the first output megapixel, ${fmtUsd(pricing.extraMegapixel)} per extra megapixel of input and output`;
+  }
+}
+
+/** Output pixels implied by the `image_size` field we send, for endpoints that do not report dimensions. */
+const PRESET_PIXELS: Record<string, number> = {
+  square_hd: 1024 * 1024,
+  square: 512 * 512,
+  landscape_4_3: 1024 * 768,
+  landscape_16_9: 1024 * 576,
+  portrait_4_3: 768 * 1024,
+  portrait_16_9: 576 * 1024,
+};
+
+export function requestedOutputPixels(fields: Record<string, JsonValue>): number | undefined {
+  const size = fields.image_size;
+  if (typeof size === 'string') return PRESET_PIXELS[size];
+  if (size && typeof size === 'object' && !Array.isArray(size)) {
+    const { width, height } = size as { width?: unknown; height?: unknown };
+    if (typeof width === 'number' && typeof height === 'number') return width * height;
+  }
+  return undefined;
+}
+
+async function pixelsOf(bytes: Uint8Array): Promise<number | undefined> {
+  try {
+    const m = await sharp(bytes).metadata();
+    return m.width && m.height ? m.width * m.height : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export interface FalModelDef {
   /** fal endpoint id, e.g. `fal-ai/flux-pro/v1.1-ultra`. Also our model slug. */
   endpoint: string;
@@ -102,8 +232,8 @@ export interface FalModelDef {
   settings: z.ZodObject<z.ZodRawShape>;
   /** Optional per-model rewrite of settings into fal input fields. */
   mapSettings?: (settings: Record<string, unknown>, req: ResolvedRequest) => Record<string, JsonValue>;
-  /** Approximate USD per image, when fal publishes a flat rate. */
-  pricePerImage?: number;
+  /** List price from the endpoint's fal page; the source of the per-generation cost estimate. */
+  pricing: FalPricing;
   concurrency?: number;
 }
 
@@ -134,7 +264,7 @@ export const FAL_MODELS: readonly FalModelDef[] = [
       raw: z.boolean().default(false).describe('Less processed, more natural-looking images'),
       image_prompt_strength: z.number().min(0).max(1).default(0.1).describe('Influence of the reference image'),
     }),
-    pricePerImage: 0.06,
+    pricing: { kind: 'per_image', usd: 0.06 },
   },
   {
     endpoint: 'fal-ai/flux-pro/v1.1',
@@ -148,7 +278,7 @@ export const FAL_MODELS: readonly FalModelDef[] = [
     negativePrompt: false,
     outputFormats: ['jpeg', 'png'],
     settings: fluxProSettings,
-    pricePerImage: 0.04,
+    pricing: { kind: 'per_image', usd: 0.04 },
   },
   {
     endpoint: 'fal-ai/flux-pro/kontext/max',
@@ -164,7 +294,7 @@ export const FAL_MODELS: readonly FalModelDef[] = [
     settings: fluxProSettings.extend({
       guidance_scale: z.number().min(1).max(20).default(3.5).describe('CFG scale'),
     }),
-    pricePerImage: 0.08,
+    pricing: { kind: 'per_image', usd: 0.08 },
   },
   {
     endpoint: 'fal-ai/flux-2-pro',
@@ -181,6 +311,7 @@ export const FAL_MODELS: readonly FalModelDef[] = [
       safety_tolerance: safetyTolerance5.default('2').describe('1 = strictest, 5 = most permissive'),
       enable_safety_checker: z.boolean().default(true),
     }),
+    pricing: FLUX2_PRO_PRICING,
   },
   {
     endpoint: 'fal-ai/flux-2-pro/edit',
@@ -197,6 +328,7 @@ export const FAL_MODELS: readonly FalModelDef[] = [
       safety_tolerance: safetyTolerance5.default('2').describe('1 = strictest, 5 = most permissive'),
       enable_safety_checker: z.boolean().default(true),
     }),
+    pricing: FLUX2_PRO_PRICING,
   },
   {
     endpoint: 'fal-ai/flux-2',
@@ -216,6 +348,7 @@ export const FAL_MODELS: readonly FalModelDef[] = [
       enable_safety_checker: z.boolean().default(true),
       enable_prompt_expansion: z.boolean().default(false),
     }),
+    pricing: { kind: 'per_megapixel', usd: 0.012 },
   },
   {
     endpoint: 'fal-ai/flux/dev',
@@ -234,7 +367,7 @@ export const FAL_MODELS: readonly FalModelDef[] = [
       acceleration: acceleration.default('none'),
       enable_safety_checker: z.boolean().default(true),
     }),
-    pricePerImage: 0.025,
+    pricing: { kind: 'per_megapixel', usd: 0.025 },
   },
   {
     endpoint: 'fal-ai/flux/schnell',
@@ -253,7 +386,7 @@ export const FAL_MODELS: readonly FalModelDef[] = [
       acceleration: acceleration.default('none'),
       enable_safety_checker: z.boolean().default(true),
     }),
-    pricePerImage: 0.003,
+    pricing: { kind: 'per_megapixel', usd: 0.003 },
   },
   {
     endpoint: 'fal-ai/nano-banana-2',
@@ -276,7 +409,7 @@ export const FAL_MODELS: readonly FalModelDef[] = [
       thinking_level: z.enum(['minimal', 'high']).optional(),
       system_prompt: z.string().optional(),
     }),
-    pricePerImage: 0.08,
+    pricing: { kind: 'per_image_by_setting', setting: 'resolution', usd: { '0.5K': 0.06, '1K': 0.08, '2K': 0.12, '4K': 0.16 }, default: '1K', surcharges: [{ setting: 'thinking_level', value: 'high', usd: 0.002 }] },
   },
   {
     endpoint: 'fal-ai/nano-banana-2/edit',
@@ -299,7 +432,7 @@ export const FAL_MODELS: readonly FalModelDef[] = [
       thinking_level: z.enum(['minimal', 'high']).optional(),
       system_prompt: z.string().optional(),
     }),
-    pricePerImage: 0.08,
+    pricing: { kind: 'per_image_by_setting', setting: 'resolution', usd: { '0.5K': 0.06, '1K': 0.08, '2K': 0.12, '4K': 0.16 }, default: '1K', surcharges: [{ setting: 'thinking_level', value: 'high', usd: 0.002 }] },
   },
   {
     endpoint: 'fal-ai/nano-banana-pro',
@@ -317,7 +450,7 @@ export const FAL_MODELS: readonly FalModelDef[] = [
       safety_tolerance: safetyTolerance6.default('4').describe('1 = strictest, 6 = most permissive'),
       system_prompt: z.string().optional(),
     }),
-    pricePerImage: 0.15,
+    pricing: { kind: 'per_image_by_setting', setting: 'resolution', usd: { '1K': 0.15, '2K': 0.15, '4K': 0.3 }, default: '1K' },
   },
   {
     endpoint: 'fal-ai/ideogram/v3',
@@ -334,6 +467,7 @@ export const FAL_MODELS: readonly FalModelDef[] = [
       style: z.enum(['AUTO', 'GENERAL', 'REALISTIC', 'DESIGN']).optional(),
       expand_prompt: z.boolean().default(true).describe('Use MagicPrompt to expand the prompt'),
     }),
+    pricing: { kind: 'per_image_by_setting', setting: 'rendering_speed', usd: { TURBO: 0.03, BALANCED: 0.06, QUALITY: 0.09 }, default: 'BALANCED' },
   },
   {
     endpoint: 'fal-ai/recraft/v3/text-to-image',
@@ -349,7 +483,7 @@ export const FAL_MODELS: readonly FalModelDef[] = [
       style: z.string().default('realistic_image').describe('Recraft style id, e.g. realistic_image, digital_illustration, vector_illustration'),
       enable_safety_checker: z.boolean().default(false),
     }),
-    pricePerImage: 0.04,
+    pricing: { kind: 'per_image', usd: 0.04 },
   },
   {
     endpoint: 'fal-ai/recraft/v4/text-to-image',
@@ -364,6 +498,7 @@ export const FAL_MODELS: readonly FalModelDef[] = [
     settings: z.object({
       enable_safety_checker: z.boolean().default(true),
     }),
+    pricing: { kind: 'per_image', usd: 0.04 },
   },
   {
     endpoint: 'fal-ai/bytedance/seedream/v4.5/text-to-image',
@@ -378,7 +513,7 @@ export const FAL_MODELS: readonly FalModelDef[] = [
     settings: z.object({
       enable_safety_checker: z.boolean().default(true),
     }),
-    pricePerImage: 0.04,
+    pricing: { kind: 'per_image', usd: 0.04 },
   },
   {
     endpoint: 'fal-ai/z-image/turbo',
@@ -397,6 +532,7 @@ export const FAL_MODELS: readonly FalModelDef[] = [
       enable_safety_checker: z.boolean().default(true),
       enable_prompt_expansion: z.boolean().default(false),
     }),
+    pricing: { kind: 'per_megapixel', usd: 0.005 },
   },
   {
     endpoint: 'fal-ai/qwen-image',
@@ -415,6 +551,7 @@ export const FAL_MODELS: readonly FalModelDef[] = [
       acceleration: acceleration.default('none'),
       enable_safety_checker: z.boolean().default(true),
     }),
+    pricing: { kind: 'per_megapixel', usd: 0.02 },
   },
 ];
 
@@ -532,6 +669,7 @@ function specFor(def: FalModelDef): ModelSpec {
     description: def.description,
     capabilities: caps,
     settings: def.settings,
+    pricing: describeFalPricing(def.pricing),
     validateRequest: (req, inputs) => validateRequestFor(def, req, inputs),
     ...(def.concurrency !== undefined ? { concurrency: def.concurrency } : {}),
   };
@@ -585,6 +723,9 @@ const resultSchema = z
   })
   .loose();
 
+/** What the cost estimate needs beyond the response, recorded on the handle so `resume()` can price too. */
+export type FalPricingContext = { settings: JsonObject; outputPixels?: number; inputPixels?: number[] };
+
 export type FalRefData = {
   endpoint: string;
   requestId: string;
@@ -592,6 +733,7 @@ export type FalRefData = {
   responseUrl: string;
   cancelUrl: string;
   count: number;
+  pricing?: FalPricingContext;
 };
 
 export function refDataOf(ref: ProviderRef): FalRefData {
@@ -602,7 +744,24 @@ export function refDataOf(ref: ProviderRef): FalRefData {
   const responseUrl = str('responseUrl');
   const cancelUrl = str('cancelUrl');
   if (!requestId || !statusUrl || !responseUrl || !cancelUrl) throw new ProviderError('fal: providerRef is missing queue URLs', { retryable: false, code: 'bad_ref' });
-  return { endpoint: str('endpoint') ?? '', requestId, statusUrl, responseUrl, cancelUrl, count: typeof d.count === 'number' ? d.count : 1 };
+  return {
+    endpoint: str('endpoint') ?? '',
+    requestId,
+    statusUrl,
+    responseUrl,
+    cancelUrl,
+    count: typeof d.count === 'number' ? d.count : 1,
+    ...(isPricingContext(d.pricing) ? { pricing: d.pricing } : {}),
+  };
+}
+
+function isPricingContext(v: unknown): v is FalPricingContext {
+  if (!v || typeof v !== 'object' || Array.isArray(v)) return false;
+  const p = v as Record<string, unknown>;
+  if (!p.settings || typeof p.settings !== 'object' || Array.isArray(p.settings)) return false;
+  if (p.outputPixels !== undefined && typeof p.outputPixels !== 'number') return false;
+  if (p.inputPixels !== undefined && !(Array.isArray(p.inputPixels) && p.inputPixels.every((n) => typeof n === 'number'))) return false;
+  return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -698,9 +857,10 @@ export function createFalProvider(opts: FalOptions): Provider {
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const auth = { Authorization: `Key ${opts.apiKey}` };
 
-  /** Upload one input asset to fal storage; returns its public URL. Safe to repeat. */
-  async function upload(assetId: string, ctx: GenerateContext): Promise<string> {
+  /** Upload one input asset to fal storage; returns its public URL (and its pixel count when `measure`). Safe to repeat. */
+  async function upload(assetId: string, ctx: GenerateContext, measure: boolean): Promise<{ url: string; pixels?: number }> {
     const a = await ctx.asset(assetId);
+    const pixels = measure ? await pixelsOf(a.bytes) : undefined;
     const fileName = `${assetId}.${EXT_BY_MIME[a.mime] ?? 'bin'}`;
     let initiated: { upload_url: string; file_url: string };
     try {
@@ -733,7 +893,7 @@ export function createFalProvider(opts: FalOptions): Provider {
       if (ctx.signal.aborted) throw ctx.signal.reason ?? e;
       throw new ProviderError(`fal: upload ${assetId} failed: ${(e as Error)?.message ?? String(e)}`, { retryable: true, code: 'upload_failed', cause: e });
     }
-    return initiated.file_url;
+    return { url: initiated.file_url, ...(pixels !== undefined ? { pixels } : {}) };
   }
 
   async function monitor(data: FalRefData, def: FalModelDef | undefined, ctx: GenerateContext): Promise<GenerateResult> {
@@ -831,8 +991,21 @@ export function createFalProvider(opts: FalOptions): Provider {
       ...(result.timings ? { timings: result.timings } : {}),
       ...(status.metrics?.inference_time !== undefined ? { inferenceTime: status.metrics.inference_time } : {}),
     };
-    const cost = def?.pricePerImage !== undefined ? Math.round(def.pricePerImage * outputs.length * 1_000_000) / 1_000_000 : undefined;
+    const cost = def ? estimateFalCost(def.pricing, costInputFor(data, outputs)) : undefined;
     return { outputs, ...(cost !== undefined ? { cost } : {}), providerMeta };
+  }
+
+  /** Output pixels come from the response when fal reports them, else from the size we asked for. */
+  function costInputFor(data: FalRefData, outputs: OutputDescriptor[]): FalCostInput {
+    const outputPixels = outputs.map((o) => {
+      const m = (o.meta ?? {}) as { width?: unknown; height?: unknown };
+      return typeof m.width === 'number' && typeof m.height === 'number' ? m.width * m.height : data.pricing?.outputPixels;
+    });
+    return {
+      settings: data.pricing?.settings ?? {},
+      outputPixels,
+      ...(data.pricing?.inputPixels ? { inputPixels: data.pricing.inputPixels } : {}),
+    };
   }
 
   return {
@@ -846,9 +1019,22 @@ export function createFalProvider(opts: FalOptions): Provider {
       if (!def) throw new ProviderError(`unknown fal model ${req.model}`, { kind: 'unsupported' });
 
       const imageInputs = req.inputs.filter((i) => i.role !== 'mask');
+      const measure = def.pricing.kind === 'flux2_pro';
       const imageUrls: string[] = [];
-      for (const input of imageInputs) imageUrls.push(await upload(input.asset, ctx));
+      const inputPixels: number[] = [];
+      for (const i of imageInputs) {
+        const up = await upload(i.asset, ctx, measure);
+        imageUrls.push(up.url);
+        if (up.pixels !== undefined) inputPixels.push(up.pixels);
+      }
       const input = buildInput(req, def, imageUrls);
+      const outputPixels = requestedOutputPixels(sizeFields(req, def).fields);
+      const pricing: FalPricingContext = {
+        settings: req.settings as JsonObject,
+        ...(outputPixels !== undefined ? { outputPixels } : {}),
+        // Only complete when every input could be measured; a partial sum would under-price.
+        ...(inputPixels.length === imageInputs.length ? { inputPixels } : {}),
+      };
 
       let submitted: z.infer<typeof submitSchema>;
       try {
@@ -875,6 +1061,7 @@ export function createFalProvider(opts: FalOptions): Provider {
         responseUrl: submitted.response_url,
         cancelUrl: submitted.cancel_url,
         count: req.count,
+        pricing,
       };
       await ctx.setProviderRef({ version: REF_VERSION, model: req.model, data: { ...data } });
       return monitor(data, def, ctx);

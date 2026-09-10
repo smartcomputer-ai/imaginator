@@ -31,6 +31,7 @@ describe('http', () => {
     const models = await getJson(`${base}/api/models.list`);
     expect(models.models.map((m: { id: string }) => m.id)).toContain('mock/fast');
     expect(models.models[0].settingsSchema.type).toBe('object');
+    expect(models.models.every((m: { pricing?: string }) => typeof m.pricing === 'string')).toBe(true);
 
     const created = await post(base, 'collections.create', { slug: 'http', title: 'HTTP' });
     expect(created.status).toBe(200);
@@ -52,6 +53,8 @@ describe('http', () => {
     const view = await getJson(`${base}/api/collections.get?collection=http`);
     expect(view.cells).toHaveLength(4);
     expect(view.cells.every((c: { status: string }) => c.status === 'succeeded')).toBe(true);
+    // The grid carries the estimated cost of each current generation (mock: $0.001 per image).
+    expect(view.cells.every((c: { cost?: number }) => c.cost === 0.001)).toBe(true);
     const url = view.cells[0].urls[0] as string;
     const img = await fetch(`${base}${url}`);
     expect(img.status).toBe(200);

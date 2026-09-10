@@ -17,6 +17,7 @@ export function ColumnHeader({
   index,
   total,
   order,
+  spend,
 }: {
   slug: string;
   column: Column;
@@ -24,6 +25,8 @@ export function ColumnHeader({
   index: number;
   total: number;
   order: string[];
+  /** Estimated USD of the column's current generations, when any cell reports a cost. */
+  spend?: number;
 }) {
   const remove = useCommand('columns.remove');
   const reorder = useCommand('columns.reorder');
@@ -48,6 +51,11 @@ export function ColumnHeader({
         {column.count > 1 && (
           <WithTooltip label={`${column.count} outputs per cell`}>
             <Badge variant="secondary">×{column.count}</Badge>
+          </WithTooltip>
+        )}
+        {spend !== undefined && (
+          <WithTooltip label={`Estimated spend on this column's current cells${model?.pricing ? `. ${model.pricing}` : ''}`}>
+            <span className="shrink-0 text-[11px] tabular-nums text-muted-foreground">{formatUsd(spend)}</span>
           </WithTooltip>
         )}
         <div className="ml-auto flex shrink-0 items-center opacity-0 transition-opacity group-hover:opacity-100 focus-within:opacity-100">
@@ -95,6 +103,10 @@ export function ColumnHeader({
   );
 }
 
+export function formatUsd(usd: number): string {
+  return usd < 0.01 ? `$${usd.toFixed(4)}` : `$${usd.toFixed(2)}`;
+}
+
 function ColumnSettings({ slug, column, model, onDone }: { slug: string; column: Column; model: ModelInfo | undefined; onDone: () => void }) {
   const [id, setId] = useState(column.id);
   const [count, setCount] = useState(String(column.count));
@@ -126,6 +138,7 @@ function ColumnSettings({ slug, column, model, onDone }: { slug: string; column:
             <Badge variant="outline">honors: {model.capabilities.commonKeys.join(', ') || 'none'}</Badge>
           </div>
         )}
+        {model?.pricing && <div className="mt-1 tabular-nums">{model.pricing}</div>}
       </div>
       <div className="grid grid-cols-[1fr_5rem] gap-2">
         <div className="grid gap-1">

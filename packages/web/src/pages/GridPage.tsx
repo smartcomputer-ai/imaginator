@@ -4,6 +4,7 @@ import { Columns3, Rows3 } from 'lucide-react';
 import { useEvents } from '@/api/events';
 import { useCollection, useModels } from '@/api/queries';
 import { useEscapeTo } from '@/lib/useEscapeTo';
+import { useScrollMemory } from '@/lib/useScrollMemory';
 import { Button } from '@/components/ui/button';
 import { Spinner } from '@/components/ui/spinner';
 import { AddColumnDialog } from '@/features/grid/AddColumnDialog';
@@ -19,6 +20,7 @@ const ROW_HEADER_WIDTH = 300;
 export function GridPage() {
   const { slug = '' } = useParams();
   useEscapeTo('/');
+  const scrollRef = useScrollMemory<HTMLDivElement>(`grid:${slug}`);
   useEvents(slug);
   const { data: collection, isLoading, error } = useCollection(slug);
   const models = useModels();
@@ -31,6 +33,11 @@ export function GridPage() {
   const rows = useMemo(() => [...(collection?.rows ?? [])].sort((a, b) => a.position - b.position), [collection]);
   const cellMap = useMemo(() => new Map((collection?.cells ?? []).map((c) => [`${c.row}/${c.column}`, c])), [collection]);
   const columnOrder = useMemo(() => columns.map((c) => c.id), [columns]);
+  const spendByColumn = useMemo(() => {
+    const totals = new Map<string, number>();
+    for (const c of collection?.cells ?? []) if (c.cost !== undefined) totals.set(c.column, (totals.get(c.column) ?? 0) + c.cost);
+    return totals;
+  }, [collection]);
   const rowOrder = useMemo(() => rows.map((r) => r.id), [rows]);
 
   if (isLoading) {
@@ -47,7 +54,7 @@ export function GridPage() {
   return (
     <div className="flex h-full min-h-0 flex-col">
       <GridHeader collection={collection} zoom={zoom} />
-      <div className="min-h-0 flex-1 overflow-auto">
+      <div ref={scrollRef} className="min-h-0 flex-1 overflow-auto">
         {columns.length === 0 && rows.length === 0 ? (
           <EmptyState onAddColumn={() => setAddColumn(true)} onAddRow={() => setAddRow(true)} />
         ) : (
@@ -61,7 +68,7 @@ export function GridPage() {
                   <th key={col.id} className="sticky top-0 z-10 border-b border-r bg-card p-0 align-top font-normal" style={{ minWidth: zoom.cellSize + 12, width: zoom.cellSize + 12, maxWidth: zoom.cellSize + 12 }}>
                     {/* Fixed-width wrapper: the image decides the column width, long ids and model names truncate. */}
                     <div className="overflow-hidden" style={{ width: zoom.cellSize + 12 }}>
-                      <ColumnHeader slug={slug} column={col} model={modelById.get(col.model)} index={i} total={columns.length} order={columnOrder} />
+                      <ColumnHeader slug={slug} column={col} model={modelById.get(col.model)} index={i} total={columns.length} order={columnOrder} spend={spendByColumn.get(col.id)} />
                     </div>
                   </th>
                 ))}

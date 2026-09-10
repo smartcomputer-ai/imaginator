@@ -83,34 +83,48 @@ export function CollectionsPage() {
         <table className="w-full border-separate border-spacing-0 text-[13px]">
           <thead>
             <tr className="text-left text-[11px] uppercase tracking-wide text-muted-foreground">
-              <th className="border-b px-2 py-1.5 font-medium">Title</th>
-              <th className="border-b px-2 py-1.5 font-medium">Status</th>
-              <th className="border-b px-2 py-1.5 font-medium text-right">Grid</th>
-              <th className="border-b px-2 py-1.5 font-medium">Cells</th>
-              <th className="border-b px-2 py-1.5 font-medium">Updated</th>
+              {/* w-full + max-w-0: the title column takes the remaining width and wraps instead of pushing the table wider. */}
+              <th className="w-full max-w-0 border-b px-2 py-1.5 font-medium">Title</th>
+              <th className="whitespace-nowrap border-b px-2 py-1.5 font-medium">Status</th>
+              <th className="whitespace-nowrap border-b px-2 py-1.5 font-medium text-right">Grid</th>
+              <th className="whitespace-nowrap border-b px-2 py-1.5 font-medium">Cells</th>
+              <th className="whitespace-nowrap border-b px-2 py-1.5 font-medium">Updated</th>
               <th className="border-b px-2 py-1.5" />
             </tr>
           </thead>
           <tbody>
             {collections.map((c) => (
-              <tr key={c.slug} className="group hover:bg-accent/40">
-                <td className="border-b px-2 py-1.5">
-                  <Link to={`/c/${c.slug}`} className="font-medium hover:underline">
+              <tr
+                key={c.slug}
+                className="group cursor-pointer hover:bg-accent/40 focus-visible:bg-accent/40 focus-visible:outline-none"
+                tabIndex={0}
+                onClick={(e) => {
+                  // Links and buttons inside the row keep their own behaviour.
+                  if ((e.target as HTMLElement).closest('a, button')) return;
+                  if (e.metaKey || e.ctrlKey) window.open(`/c/${c.slug}`, '_blank');
+                  else navigate(`/c/${c.slug}`);
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' && e.target === e.currentTarget) navigate(`/c/${c.slug}`);
+                }}
+              >
+                <td className="w-full max-w-0 border-b px-2 py-1.5">
+                  <Link to={`/c/${c.slug}`} className="font-medium break-words hover:underline" tabIndex={-1}>
                     {c.title || c.slug}
                   </Link>
                   <span className="ml-2 font-mono text-[11px] text-muted-foreground">{c.slug}</span>
-                  {c.description && <div className="truncate text-xs text-muted-foreground">{c.description}</div>}
+                  {c.description && <div className="whitespace-pre-wrap break-words text-xs text-muted-foreground">{c.description}</div>}
                 </td>
                 <td className="border-b px-2 py-1.5">
                   <Badge variant={c.status === 'live' ? 'green' : 'muted'}>{c.status}</Badge>
                 </td>
-                <td className="border-b px-2 py-1.5 text-right tabular-nums text-muted-foreground">
+                <td className="whitespace-nowrap border-b px-2 py-1.5 text-right tabular-nums text-muted-foreground">
                   {c.rows} × {c.columns}
                 </td>
                 <td className="border-b px-2 py-1.5">
                   <CellCounts succeeded={c.succeeded} inFlight={c.inFlight} queued={c.queued} failed={c.failed} total={c.cells} />
                 </td>
-                <td className="border-b px-2 py-1.5 text-muted-foreground" title={c.updatedAt}>
+                <td className="whitespace-nowrap border-b px-2 py-1.5 text-muted-foreground" title={c.updatedAt}>
                   {relativeTime(c.updatedAt)}
                 </td>
                 <td className="border-b px-2 py-1.5 text-right">

@@ -35,6 +35,8 @@ export interface ModelSpec {
   concurrency?: number;
   /** Optional free-text description shown in model pickers. */
   description?: string;
+  /** One-line, human-readable price ("$0.04 per image", "$0.012 per megapixel"). Estimates only; see each adapter. */
+  pricing?: string;
 }
 
 export interface GenerateContext {

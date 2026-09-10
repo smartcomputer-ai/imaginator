@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
-import { Link, useParams } from 'react-router';
+import { Link, useNavigate, useParams } from 'react-router';
 import { assetThumbUrl, assetUrl, INPUT_ROLES, isActiveStatus, type Generation, type InputRole } from '@imaginator/core';
-import { ArrowLeft, Download, ImagePlus, Images } from 'lucide-react';
+import { ArrowLeft, ChevronDown, ChevronLeft, ChevronRight, ChevronUp, Download, ImagePlus, Images } from 'lucide-react';
 import { useEvents } from '@/api/events';
 import { useApi, useCell, useCollection, useGeneration } from '@/api/queries';
 import { StatusBadge } from '@/components/StatusBadge';
@@ -12,6 +12,7 @@ import { Label } from '@/components/ui/label';
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Spinner } from '@/components/ui/spinner';
+import { WithTooltip } from '@/components/ui/tooltip';
 import { cn, durationMs, formatDuration, relativeTime } from '@/lib/utils';
 import { useEscapeTo } from '@/lib/useEscapeTo';
 import { toast } from 'sonner';
@@ -22,10 +23,42 @@ export function CellPage() {
   useEvents(slug);
   useEscapeTo(`/c/${slug}`);
   const cellQ = useCell(address);
+  const navigate = useNavigate();
+
+  // Neighbouring cells in grid order: ← → move across columns, ↑ ↓ across rows.
+  const collectionQ = useCollection(slug);
+  const rowIds = collectionQ.data?.rows.map((r) => r.id) ?? [];
+  const colIds = collectionQ.data?.columns.map((c) => c.id) ?? [];
+  const rowIndex = rowIds.indexOf(row);
+  const colIndex = colIds.indexOf(col);
+  const neighbour = (dr: number, dc: number): string | undefined => {
+    if (rowIndex < 0 || colIndex < 0) return undefined;
+    const r = rowIds[rowIndex + dr];
+    const c = colIds[colIndex + dc];
+    return r !== undefined && c !== undefined ? `/c/${slug}/${r}/${c}` : undefined;
+  };
+  const nav = { left: neighbour(0, -1), right: neighbour(0, 1), up: neighbour(-1, 0), down: neighbour(1, 0) };
+  useEffect(() => {
+    const keys: Record<string, string | undefined> = { ArrowLeft: nav.left, ArrowRight: nav.right, ArrowUp: nav.up, ArrowDown: nav.down };
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (!(e.key in keys) || e.defaultPrevented || e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
+      const t = e.target as HTMLElement | null;
+      if (t && (t.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(t.tagName))) return;
+      const to = keys[e.key];
+      if (!to) return;
+      e.preventDefault();
+      navigate(to);
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [nav.left, nav.right, nav.up, nav.down, navigate]);
   const [selectedVersion, setSelectedVersion] = useState<number | undefined>();
   const current = cellQ.data?.current;
   const versions = cellQ.data?.versions ?? [];
   const currentVersion = current?.version;
+
+  // Moving to another cell drops an explicit version pick; it belonged to the previous cell.
+  useEffect(() => setSelectedVersion(undefined), [address]);
 
   // Follow the current version until the user picks one explicitly.
   useEffect(() => {
@@ -62,6 +95,28 @@ export function CellPage() {
             <ArrowLeft /> {slug}
           </Link>
         </Button>
+        <div className="flex items-center rounded-md border">
+          <WithTooltip label="Previous column (←)">
+            <Button variant="ghost" size="iconSm" disabled={!nav.left} onClick={() => nav.left && navigate(nav.left)}>
+              <ChevronLeft />
+            </Button>
+          </WithTooltip>
+          <WithTooltip label="Previous row (↑)">
+            <Button variant="ghost" size="iconSm" disabled={!nav.up} onClick={() => nav.up && navigate(nav.up)}>
+              <ChevronUp />
+            </Button>
+          </WithTooltip>
+          <WithTooltip label="Next row (↓)">
+            <Button variant="ghost" size="iconSm" disabled={!nav.down} onClick={() => nav.down && navigate(nav.down)}>
+              <ChevronDown />
+            </Button>
+          </WithTooltip>
+          <WithTooltip label="Next column (→)">
+            <Button variant="ghost" size="iconSm" disabled={!nav.right} onClick={() => nav.right && navigate(nav.right)}>
+              <ChevronRight />
+            </Button>
+          </WithTooltip>
+        </div>
         <span className="font-mono text-sm font-semibold">
           {row}/{col}
         </span>
