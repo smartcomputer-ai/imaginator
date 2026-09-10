@@ -3,6 +3,7 @@ import { useParams } from 'react-router';
 import { Columns3, Rows3 } from 'lucide-react';
 import { useEvents } from '@/api/events';
 import { useCollection, useModels } from '@/api/queries';
+import { useEscapeTo } from '@/lib/useEscapeTo';
 import { Button } from '@/components/ui/button';
 import { Spinner } from '@/components/ui/spinner';
 import { AddColumnDialog } from '@/features/grid/AddColumnDialog';
@@ -17,6 +18,7 @@ const ROW_HEADER_WIDTH = 300;
 
 export function GridPage() {
   const { slug = '' } = useParams();
+  useEscapeTo('/');
   useEvents(slug);
   const { data: collection, isLoading, error } = useCollection(slug);
   const models = useModels();

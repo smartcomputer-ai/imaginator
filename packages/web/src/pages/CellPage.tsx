@@ -13,12 +13,14 @@ import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Spinner } from '@/components/ui/spinner';
 import { cn, durationMs, formatDuration, relativeTime } from '@/lib/utils';
+import { useEscapeTo } from '@/lib/useEscapeTo';
 import { toast } from 'sonner';
 
 export function CellPage() {
   const { slug = '', row = '', col = '' } = useParams();
   const address = `${slug}/${row}/${col}`;
   useEvents(slug);
+  useEscapeTo(`/c/${slug}`);
   const cellQ = useCell(address);
   const [selectedVersion, setSelectedVersion] = useState<number | undefined>();
   const current = cellQ.data?.current;

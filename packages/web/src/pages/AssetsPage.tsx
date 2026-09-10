@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { useSearchParams } from 'react-router';
 import { assetThumbUrl, assetUrl, type AssetView } from '@imaginator/core';
 import { Copy, ImagePlus, Upload } from 'lucide-react';
+import { useEscapeTo } from '@/lib/useEscapeTo';
 import { useEvents } from '@/api/events';
 import { useAssets, useCommand } from '@/api/queries';
 import { ASSET_DRAG_TYPE, useUploadFiles } from '@/api/upload';
@@ -18,6 +19,7 @@ import { toast } from 'sonner';
 type Origin = 'all' | 'upload' | 'generation';
 
 export function AssetsPage() {
+  useEscapeTo('/');
   useEvents();
   const [params] = useSearchParams();
   const focus = params.get('focus') ?? undefined;
