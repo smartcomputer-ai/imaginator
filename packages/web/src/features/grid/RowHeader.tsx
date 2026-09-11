@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import { Link } from 'react-router';
 import { assetThumbUrl, INPUT_ROLES, isRef, type CommonSettings, type Input as RowInputRef, type InputRole, type Row } from '@imaginator/core';
 import { ChevronDown, ChevronUp, Columns3, Copy, CornerDownRight, ImagePlus, MoreHorizontal, Pause, Play, Settings2, StickyNote, Trash2, X } from 'lucide-react';
 import { ReferencePicker } from '@/components/ReferencePicker';
@@ -271,10 +272,14 @@ export function RowHeader({
             title={`${isRef(inp) ? `live: current output of ${refLabel(inp)}${inp.column ? '' : ' in the same column'}` : inp.asset} · ${inp.role}${inp.maskFor !== undefined ? ` for #${inp.maskFor}` : ''}`}
           >
             {isRef(inp) ? (
-              <div className="flex size-full flex-col items-center justify-center pb-3 text-muted-foreground">
+              <Link
+                to={`/c/${inp.collection ?? slug}#${inp.row}${inp.column ? `/${inp.column}` : ''}`}
+                className="flex size-full flex-col items-center justify-center pb-3 text-muted-foreground hover:text-foreground"
+                title={`Jump to ${refLabel(inp)}`}
+              >
                 <CornerDownRight className="size-3" />
                 <span className="max-w-full truncate font-mono text-[10px] leading-none">{refLabel(inp)}</span>
-              </div>
+              </Link>
             ) : (
               <img src={assetThumbUrl(inp.asset)} alt={inp.asset} className="size-full object-cover" loading="lazy" draggable={false} />
             )}

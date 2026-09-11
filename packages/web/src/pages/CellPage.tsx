@@ -21,7 +21,7 @@ export function CellPage() {
   const { slug = '', row = '', col = '' } = useParams();
   const address = `${slug}/${row}/${col}`;
   useEvents(slug);
-  useEscapeTo(`/c/${slug}`);
+  useEscapeTo(`/c/${slug}#${row}/${col}`);
   const cellQ = useCell(address);
   const navigate = useNavigate();
   const addRows = useCommand('rows.add');
@@ -46,9 +46,16 @@ export function CellPage() {
   useEffect(() => {
     const keys: Record<string, string | undefined> = { ArrowLeft: nav.left, ArrowRight: nav.right, ArrowUp: nav.up, ArrowDown: nav.down };
     const onKeyDown = (e: KeyboardEvent) => {
-      if (!(e.key in keys) || e.defaultPrevented || e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
+      if (e.defaultPrevented || e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
       const t = e.target as HTMLElement | null;
-      if (t && (t.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(t.tagName))) return;
+      if (t && (t.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(t.tagName) || t.closest('[role="dialog"], [role="menu"], [role="listbox"]'))) return;
+      if (e.key === 'Enter' || e.key === ' ') {
+        // Enter on the detail view opens the fullscreen view (the lightbox handles its own keys).
+        e.preventDefault();
+        setLightbox((l) => (l === null ? 0 : l));
+        return;
+      }
+      if (!(e.key in keys)) return;
       const to = keys[e.key];
       if (!to) return;
       e.preventDefault();

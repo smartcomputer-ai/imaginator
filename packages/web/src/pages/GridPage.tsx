@@ -1,5 +1,5 @@
-import { useMemo, useState } from 'react';
-import { useParams } from 'react-router';
+import { useEffect, useMemo, useState } from 'react';
+import { useLocation, useNavigate, useParams } from 'react-router';
 import { Columns3, Rows3 } from 'lucide-react';
 import { useEvents } from '@/api/events';
 import { useCollection, useModels } from '@/api/queries';
@@ -17,8 +17,31 @@ import { RowHeader } from '@/features/grid/RowHeader';
 
 const ROW_HEADER_WIDTH = 300;
 
+/** Grid selection, persisted in the URL fragment: `#r3` (a row) or `#r3/flux` (a cell). */
+export type GridSelection = { row: string; column?: string };
+
+export function parseSelection(hash: string): GridSelection | undefined {
+  const raw = decodeURIComponent(hash.replace(/^#/, ''));
+  if (!raw) return undefined;
+  const [row, column] = raw.split('/');
+  if (!row) return undefined;
+  return column ? { row, column } : { row };
+}
+
+export function selectionHash(sel: GridSelection | undefined): string {
+  return sel ? `#${sel.column ? `${sel.row}/${sel.column}` : sel.row}` : '';
+}
+
+function isEditable(el: EventTarget | null): boolean {
+  if (!(el instanceof HTMLElement)) return false;
+  if (el.isContentEditable) return true;
+  return ['INPUT', 'TEXTAREA', 'SELECT'].includes(el.tagName) || el.closest('[role="dialog"], [role="menu"], [role="listbox"]') !== null;
+}
+
 export function GridPage() {
   const { slug = '' } = useParams();
+  const location = useLocation();
+  const navigate = useNavigate();
   useEscapeTo('/');
   const scrollRef = useScrollMemory<HTMLDivElement>(`grid:${slug}`);
   useEvents(slug);
@@ -39,6 +62,71 @@ export function GridPage() {
     return totals;
   }, [collection]);
   const rowOrder = useMemo(() => rows.map((r) => r.id), [rows]);
+
+  // Selection: a row or a cell, kept in the fragment so grids can be linked into.
+  const selection = useMemo(() => {
+    const sel = parseSelection(location.hash);
+    if (!sel || !rowOrder.includes(sel.row)) return undefined;
+    if (sel.column && !columnOrder.includes(sel.column)) return { row: sel.row };
+    return sel;
+  }, [location.hash, rowOrder, columnOrder]);
+  const select = (sel: GridSelection | undefined) => navigate({ hash: selectionHash(sel) }, { replace: true });
+
+  useEffect(() => {
+    if (!selection) return;
+    const id = selection.column ? `cell-${selection.row}-${selection.column}` : `row-${selection.row}`;
+    document.getElementById(id)?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+  }, [selection]);
+
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.defaultPrevented || e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
+      if (isEditable(e.target)) return;
+      if (e.key === 'Escape' && selection) {
+        // Escape clears the selection first; a second Escape leaves the grid (useEscapeTo honors preventDefault).
+        e.preventDefault();
+        select(undefined);
+        return;
+      }
+      const keys = ['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Enter', ' '];
+      if (!keys.includes(e.key) || rowOrder.length === 0) return;
+      e.preventDefault();
+      if (!selection) {
+        select({ row: rowOrder[0]! });
+        return;
+      }
+      const ri = rowOrder.indexOf(selection.row);
+      const ci = selection.column ? columnOrder.indexOf(selection.column) : -1;
+      switch (e.key) {
+        case 'ArrowUp':
+        case 'ArrowDown': {
+          const next = rowOrder[Math.min(rowOrder.length - 1, Math.max(0, ri + (e.key === 'ArrowDown' ? 1 : -1)))]!;
+          select(selection.column ? { row: next, column: selection.column } : { row: next });
+          return;
+        }
+        case 'ArrowRight': {
+          // Row → first cell; last cell → the row again.
+          if (ci === columnOrder.length - 1 || columnOrder.length === 0) select({ row: selection.row });
+          else select({ row: selection.row, column: columnOrder[ci + 1]! });
+          return;
+        }
+        case 'ArrowLeft': {
+          // Row → last cell; first cell → the row.
+          if (ci === -1) select(columnOrder.length ? { row: selection.row, column: columnOrder[columnOrder.length - 1]! } : { row: selection.row });
+          else if (ci === 0) select({ row: selection.row });
+          else select({ row: selection.row, column: columnOrder[ci - 1]! });
+          return;
+        }
+        case 'Enter':
+        case ' ':
+          if (selection.column) navigate(`/c/${slug}/${selection.row}/${selection.column}`);
+          else if (columnOrder[0]) select({ row: selection.row, column: columnOrder[0] });
+          return;
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [selection, rowOrder, columnOrder, slug, navigate]);
 
   if (isLoading) {
     return (
@@ -81,13 +169,21 @@ export function GridPage() {
             </thead>
             <tbody>
               {rows.map((row, i) => (
-                <tr key={row.id}>
-                  <td className="sticky left-0 z-10 border-b border-r bg-card p-0 align-top" style={{ minWidth: ROW_HEADER_WIDTH, width: ROW_HEADER_WIDTH }}>
+                <tr key={row.id} id={`row-${row.id}`} className={selection?.row === row.id && !selection.column ? 'bg-accent/40' : undefined}>
+                  <td
+                    className={`sticky left-0 z-10 border-b border-r bg-card p-0 align-top ${selection?.row === row.id && !selection.column ? 'ring-2 ring-inset ring-ring' : ''}`}
+                    style={{ minWidth: ROW_HEADER_WIDTH, width: ROW_HEADER_WIDTH }}
+                    onClick={(e) => {
+                      // Plain clicks on the header's chrome select the row; controls keep their own behaviour.
+                      if ((e.target as HTMLElement).closest('a, button, textarea, input, [role="menuitem"]')) return;
+                      select({ row: row.id });
+                    }}
+                  >
                     <RowHeader slug={slug} row={row} defaults={collection.defaults} index={i} total={rows.length} order={rowOrder} columns={columnOrder} />
                   </td>
                   {columns.map((col) => (
-                    <td key={col.id} className="border-b border-r p-1.5 align-top">
-                      <GridCell slug={slug} cell={cellMap.get(`${row.id}/${col.id}`)} size={zoom.cellSize} />
+                    <td key={col.id} id={`cell-${row.id}-${col.id}`} className="border-b border-r p-1.5 align-top">
+                      <GridCell slug={slug} cell={cellMap.get(`${row.id}/${col.id}`)} size={zoom.cellSize} selected={selection?.row === row.id && selection.column === col.id} />
                     </td>
                   ))}
                   <td className="border-b" />
