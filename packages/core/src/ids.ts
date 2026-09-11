@@ -89,6 +89,60 @@ export function parseGenerationRef(input: string): GenerationRef {
   return ref;
 }
 
+// ---------------------------------------------------------------------------
+// References: partial cell addresses (DESIGN §3, References)
+// ---------------------------------------------------------------------------
+
+export interface ReferenceAnchors {
+  collection?: CollectionSlug;
+  row?: RowId;
+  column?: ColumnId;
+}
+
+/**
+ * `r3` → row; `flux` → column; `r3/flux` → row + column;
+ * `coll/r3/flux` → all three. Row ids are the only segment shaped `r<digits>`,
+ * so a bare segment is never ambiguous.
+ */
+export function parseReference(input: string): ReferenceAnchors {
+  const parts = input.trim().split('/');
+  const bad = () => new AddressError(`not a reference (r3, column, r3/column, or collection/r3/column): ${input}`);
+  if (parts.some((p) => p === '')) throw bad();
+  if (parts.length === 1) {
+    const [a] = parts as [string];
+    if (ROW_ID_RE.test(a)) return { row: a };
+    if (SLUG_RE.test(a)) return { column: a };
+    throw bad();
+  }
+  if (parts.length === 2) {
+    const [r, c] = parts as [string, string];
+    if (!ROW_ID_RE.test(r) || !SLUG_RE.test(c)) throw bad();
+    return { row: r, column: c };
+  }
+  if (parts.length === 3) {
+    const [coll, r, c] = parts as [string, string, string];
+    if (!SLUG_RE.test(coll) || !ROW_ID_RE.test(r) || !SLUG_RE.test(c)) throw bad();
+    return { collection: coll, row: r, column: c };
+  }
+  throw bad();
+}
+
+/** Shortest address for `target` as seen from `origin`: `r3`, `r3/flux`, or `coll/r3/flux`. */
+export function formatReference(target: CellAddress, origin: CellAddress): string {
+  if (target.collection !== origin.collection) return formatCellAddress(target);
+  if (target.column !== origin.column) return `${target.row}/${target.column}`;
+  return target.row;
+}
+
+/** Address of a cell as named in messages: `r3/flux` inside the same collection, full elsewhere. */
+export function formatCellLabel(target: CellAddress, origin: CellAddress): string {
+  return target.collection === origin.collection ? `${target.row}/${target.column}` : formatCellAddress(target);
+}
+
+export function cellKeyOf(a: CellAddress): string {
+  return `${a.collection}/${a.row}/${a.column}`;
+}
+
 export const cellAddressSchema = z
   .string()
   .transform((s, ctx) => {

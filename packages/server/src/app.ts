@@ -56,6 +56,7 @@ export function createApp(overrides: ConfigOverrides = {}, deps: AppDeps = {}): 
   hooks.abortGenerations = (ids, reason) => runner.abort(ids, reason);
   hooks.reconcileSettled = (slug) => reconciler.settled(slug);
   hooks.reconcileNow = (slug) => reconciler.runNow(slug);
+  hooks.reconcilePending = (slug) => reconciler.isPending(slug);
   const commands = createCommandRegistry(services, registry);
   let baseUrl: string | undefined;
   const mcp = createMcpHttp({ commands, services, store, bus, version: SERVER_VERSION, baseUrl: () => baseUrl, log: config.log });

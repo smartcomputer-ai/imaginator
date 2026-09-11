@@ -76,8 +76,8 @@ describe('mcp', () => {
     expect(names).toEqual(
       [
         'add_columns', 'add_rows', 'cancel_cell', 'create_collection', 'delete_collection', 'get_asset', 'get_cell', 'get_collection',
-        'get_generation', 'list_assets', 'list_collections', 'list_models', 'regenerate_cell', 'remove_column', 'remove_rows',
-        'retry_cell', 'update_collection', 'update_column', 'update_row', 'upload_asset', 'view_images', 'wait_for_collection',
+        'get_generation', 'list_assets', 'list_collections', 'list_models', 'pin_cell', 'preview_cell_impact', 'regenerate_cell', 'remove_column', 'remove_rows',
+        'retry_cell', 'unpin_cell', 'update_collection', 'update_column', 'update_row', 'upload_asset', 'view_images', 'wait_for_collection',
       ].sort(),
     );
     // UI-only operations are deliberately absent.

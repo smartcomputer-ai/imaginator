@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import type { Column, JsonObject, ModelInfo } from '@imaginator/core';
-import { ChevronLeft, ChevronRight, Settings2, Trash2 } from 'lucide-react';
+import { ChevronLeft, ChevronRight, CornerLeftDown, Settings2, Trash2 } from 'lucide-react';
 import { useCommand } from '@/api/queries';
 import { SettingsForm } from '@/components/SettingsForm';
 import { Badge } from '@/components/ui/badge';
@@ -9,6 +9,9 @@ import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
 import { WithTooltip } from '@/components/ui/tooltip';
+import { RecipeEditor, Tabs, isDefaultRecipe, recipeDraftOf, recipeLacksInputs, recipePatch, stageSources, type RecipeDraft } from './RecipeEditor';
+
+export { refLabel, stageSources } from './RecipeEditor';
 
 export function ColumnHeader({
   slug,
@@ -41,6 +44,8 @@ export function ColumnHeader({
   };
 
   const settingCount = Object.keys(column.settings ?? {}).length;
+  const sources = stageSources(column);
+  const hasRecipe = !isDefaultRecipe(recipeDraftOf(column), model);
 
   return (
     <div className="group flex h-full min-w-0 flex-col gap-0.5 px-1 py-1 text-left">
@@ -87,6 +92,18 @@ export function ColumnHeader({
         <span className="min-w-0 truncate text-[11px] text-muted-foreground" title={column.model}>
           {model ? model.name : column.model}
         </span>
+        {sources.length > 0 && (
+          <WithTooltip label={`Pipeline stage: each row takes ${sources.map((s) => `${s}'s output`).join(' and ')} in the same row${column.prompt !== undefined ? `. Prompt: ${column.prompt}` : ''}`}>
+            <Badge variant="violet" className="shrink-0">
+              <CornerLeftDown className="size-2.5" /> {sources.join(', ')}
+            </Badge>
+          </WithTooltip>
+        )}
+        {hasRecipe && sources.length === 0 && (
+          <WithTooltip label="This column has a recipe (prompt template or inputs)">
+            <Badge variant="outline" className="shrink-0">recipe</Badge>
+          </WithTooltip>
+        )}
         <Popover open={open} onOpenChange={setOpen}>
           <PopoverTrigger asChild>
             <Button variant="ghost" size="iconSm" className="ml-auto shrink-0 text-muted-foreground">
@@ -94,8 +111,8 @@ export function ColumnHeader({
               {settingCount > 0 && <span className="text-[10px]">{settingCount}</span>}
             </Button>
           </PopoverTrigger>
-          <PopoverContent className="w-80">
-            {open && <ColumnSettings slug={slug} column={column} model={model} onDone={() => setOpen(false)} />}
+          <PopoverContent className="w-96 p-0">
+            {open && <ColumnSettings slug={slug} column={column} model={model} columns={order} onDone={() => setOpen(false)} />}
           </PopoverContent>
         </Popover>
       </div>
@@ -107,16 +124,20 @@ export function formatUsd(usd: number): string {
   return usd < 0.01 ? `$${usd.toFixed(4)}` : `$${usd.toFixed(2)}`;
 }
 
-function ColumnSettings({ slug, column, model, onDone }: { slug: string; column: Column; model: ModelInfo | undefined; onDone: () => void }) {
+type Tab = 'model' | 'recipe';
+
+function ColumnSettings({ slug, column, model, columns, onDone }: { slug: string; column: Column; model: ModelInfo | undefined; columns: string[]; onDone: () => void }) {
   const [id, setId] = useState(column.id);
   const [count, setCount] = useState(String(column.count));
   const [settings, setSettings] = useState<JsonObject>(column.settings ?? {});
+  const [recipe, setRecipe] = useState<RecipeDraft>(() => recipeDraftOf(column));
+  const [tab, setTab] = useState<Tab>(() => (isDefaultRecipe(recipeDraftOf(column), model) ? 'model' : 'recipe'));
   const update = useCommand('columns.update', { onSuccess: onDone });
   const maxCount = model?.capabilities.count;
 
   return (
     <form
-      className="grid gap-3"
+      className="flex max-h-[80vh] flex-col"
       onSubmit={(e) => {
         e.preventDefault();
         const n = Math.max(1, Math.round(Number(count) || 1));
@@ -126,39 +147,58 @@ function ColumnSettings({ slug, column, model, onDone }: { slug: string; column:
           id: id !== column.id ? id : undefined,
           count: n,
           settings: Object.keys(settings).length ? settings : null,
+          ...recipePatch(recipe, 'update'),
         });
       }}
     >
-      <div className="text-xs text-muted-foreground">
-        <span className="font-mono">{column.model}</span>
-        {model && (
-          <div className="mt-1 flex flex-wrap gap-1">
-            <Badge variant="outline">{model.capabilities.inputRoles.length ? `inputs: ${model.capabilities.inputRoles.join(', ')}` : 'text only'}</Badge>
-            {model.capabilities.negativePrompt && <Badge variant="outline">negative prompt</Badge>}
-            <Badge variant="outline">honors: {model.capabilities.commonKeys.join(', ') || 'none'}</Badge>
+      <div className="border-b p-3">
+        <Tabs
+          value={tab}
+          onChange={setTab}
+          tabs={[
+            { id: 'model', label: 'Model', hint: 'Id, count, model settings' },
+            { id: 'recipe', label: isDefaultRecipe(recipe, model) ? 'Recipe' : 'Recipe •', hint: 'Prompt template and inputs: pipeline stages' },
+          ]}
+        />
+      </div>
+      <div className="min-h-0 flex-1 overflow-auto p-3">
+        {tab === 'model' ? (
+          <div className="grid gap-3">
+            <div className="text-xs text-muted-foreground">
+              <span className="font-mono">{column.model}</span>
+              {model && (
+                <div className="mt-1 flex flex-wrap gap-1">
+                  <Badge variant="outline">{model.capabilities.inputRoles.length ? `inputs: ${model.capabilities.inputRoles.join(', ')}` : 'text only'}</Badge>
+                  {model.capabilities.negativePrompt && <Badge variant="outline">negative prompt</Badge>}
+                  <Badge variant="outline">honors: {model.capabilities.commonKeys.join(', ') || 'none'}</Badge>
+                </div>
+              )}
+              {model?.pricing && <div className="mt-1 tabular-nums">{model.pricing}</div>}
+            </div>
+            <div className="grid grid-cols-[1fr_5rem] gap-2">
+              <div className="grid gap-1">
+                <Label htmlFor="col-id">Column id</Label>
+                <Input id="col-id" className="font-mono" value={id} onChange={(e) => setId(e.target.value)} />
+              </div>
+              <div className="grid gap-1">
+                <Label htmlFor="col-count">Count{maxCount ? ` ≤${maxCount}` : ''}</Label>
+                <Input id="col-count" type="number" min={1} max={maxCount} step={1} value={count} onChange={(e) => setCount(e.target.value)} />
+              </div>
+            </div>
+            <div className="grid gap-1">
+              <Label>Model settings</Label>
+              <SettingsForm schema={model?.settingsSchema} defaults={model?.settingsDefaults} value={settings} onChange={setSettings} />
+            </div>
           </div>
+        ) : (
+          <RecipeEditor value={recipe} onChange={setRecipe} self={column.id} columns={columns} model={model} idPrefix="col-recipe" />
         )}
-        {model?.pricing && <div className="mt-1 tabular-nums">{model.pricing}</div>}
       </div>
-      <div className="grid grid-cols-[1fr_5rem] gap-2">
-        <div className="grid gap-1">
-          <Label htmlFor="col-id">Column id</Label>
-          <Input id="col-id" className="font-mono" value={id} onChange={(e) => setId(e.target.value)} />
-        </div>
-        <div className="grid gap-1">
-          <Label htmlFor="col-count">Count{maxCount ? ` ≤${maxCount}` : ''}</Label>
-          <Input id="col-count" type="number" min={1} max={maxCount} step={1} value={count} onChange={(e) => setCount(e.target.value)} />
-        </div>
-      </div>
-      <div className="grid gap-1">
-        <Label>Model settings</Label>
-        <SettingsForm schema={model?.settingsSchema} defaults={model?.settingsDefaults} value={settings} onChange={setSettings} />
-      </div>
-      <div className="flex justify-end gap-2">
+      <div className="flex justify-end gap-2 border-t p-3">
         <Button type="button" variant="ghost" size="sm" onClick={onDone}>
           Cancel
         </Button>
-        <Button type="submit" size="sm" disabled={update.isPending}>
+        <Button type="submit" size="sm" disabled={update.isPending || recipeLacksInputs(recipe, model)} title={recipeLacksInputs(recipe, model) ? 'The recipe replaces the inputs with an empty list, but this model needs an image' : undefined}>
           Save
         </Button>
       </div>

@@ -1,12 +1,18 @@
 import { and, eq, inArray } from 'drizzle-orm';
-import { isActiveStatus, isRowRef, type CollectionExport, type CollectionStatus, type CollectionView, type CommonSettings, type CollectionSummary } from '@imaginator/core';
+import { isActiveStatus, isRef, type CollectionExport, type CollectionStatus, type CollectionView, type CommonSettings, type CollectionSummary, type Input } from '@imaginator/core';
 import { nowIso, type Tx } from '../db/index.js';
-import { collections, generations } from '../db/schema.js';
+import { collections, columns, generations, refs, rows } from '../db/schema.js';
 import { conflict, invalid, notFound } from '../errors.js';
 import { addColumnTx } from './columns.js';
 import { loadAssetsById, loadCollection, requireCollection, toAsset, touchCollection, transact, type Emit, type ServiceContext } from './context.js';
-import { addRowsTx } from './rows.js';
+import { assertUnreferenced, dependentCollections, referencedCollections, rewriteRefs } from './refs.js';
+import { addRowsTx, assertReferenceTargets, finishStructuralWrite } from './rows.js';
 import { buildCollectionView, buildSummaries } from './view.js';
+
+/** Rewrite `collection: old` → `new` inside an input list. */
+function retarget(inputs: Input[], from: string, to: string): Input[] {
+  return inputs.map((i) => (isRef(i) && i.collection === from ? { ...i, collection: to } : i));
+}
 
 export interface CreateCollectionInput {
   slug: string;
@@ -77,6 +83,7 @@ export function createCollectionService(ctx: ServiceContext) {
     delete(slug: string): { ok: true } {
       const active = transact(ctx, (tx, emit) => {
         requireCollection(tx, slug);
+        assertUnreferenced(tx, { collection: slug }, { collections: [slug] }, `collection ${slug}`);
         const activeIds = tx
           .select({ id: generations.id, status: generations.status })
           .from(generations)
@@ -102,6 +109,12 @@ export function createCollectionService(ctx: ServiceContext) {
       return view(slug);
     },
 
+    /** Collections referenced by this one, and collections that reference it. */
+    dependencies(slug: string): { upstream: string[]; dependents: string[] } {
+      requireCollection(ctx.db, slug);
+      return { upstream: referencedCollections(ctx.db, slug), dependents: dependentCollections(ctx.db, slug) };
+    },
+
     duplicate(slug: string, newSlug: string, opts: { title?: string; status?: CollectionStatus } = {}): CollectionView {
       transact(ctx, (tx, emit) => {
         const src = requireCollection(tx, slug);
@@ -112,16 +125,20 @@ export function createCollectionService(ctx: ServiceContext) {
           status: opts.status ?? 'paused',
           defaults: src.defaults,
         });
-        for (const c of src.columns) addColumnTx(ctx, tx, emit, newSlug, c, true);
+        // Columns and rows may reference each other within the copy; check once at the end.
+        for (const c of src.columns) addColumnTx(ctx, tx, emit, newSlug, c, true, { skipChecks: true });
         if (src.rows.length > 0) {
           addRowsTx(
             tx,
             emit,
             newSlug,
             src.rows.map((r) => ({ ...r, id: undefined })),
-            { keepIds: src.rows.map((r) => r.id) },
+            { keepIds: src.rows.map((r) => r.id), skipChecks: true },
           );
         }
+        for (const c of src.columns) assertReferenceTargets(tx, newSlug, { column: c.id }, c.inputs);
+        for (const r of src.rows) assertReferenceTargets(tx, newSlug, { row: r.id }, r.inputs);
+        finishStructuralWrite(tx, newSlug);
       });
       return view(newSlug);
     },
@@ -133,17 +150,34 @@ export function createCollectionService(ctx: ServiceContext) {
         if (tx.select({ slug: collections.slug }).from(collections).where(eq(collections.slug, newSlug)).get()) {
           throw conflict(`collection ${newSlug} already exists`);
         }
-        // FKs are ON UPDATE CASCADE: columns, rows and generations follow.
+        // FKs are ON UPDATE CASCADE: columns, rows, generations, pins and holds follow.
         tx.update(collections).set({ slug: newSlug, updatedAt: nowIso() }).where(eq(collections.slug, slug)).run();
+        // References into this collection are written by others; rewrite them and their index entries.
+        const referrers = dependentCollections(tx, slug);
+        for (const other of referrers) {
+          for (const r of tx.select().from(rows).where(eq(rows.collection, other)).all()) {
+            tx.update(rows).set({ inputs: retarget(r.inputs, slug, newSlug) }).where(and(eq(rows.collection, other), eq(rows.id, r.id))).run();
+          }
+          for (const c of tx.select().from(columns).where(eq(columns.collection, other)).all()) {
+            if (c.inputs) tx.update(columns).set({ inputs: retarget(c.inputs, slug, newSlug) }).where(and(eq(columns.collection, other), eq(columns.id, c.id))).run();
+          }
+        }
+        tx.update(refs).set({ toCollection: newSlug }).where(eq(refs.toCollection, slug)).run();
+        rewriteRefs(tx, newSlug);
         emit({ type: 'collection.deleted', collection: slug });
         emit({ type: 'collection.created', collection: newSlug });
+        for (const other of referrers) emit({ type: 'collection.updated', collection: other });
       });
       return view(newSlug);
     },
 
     export(slug: string): CollectionExport {
       const c = requireCollection(ctx.db, slug);
-      const assetRows = loadAssetsById(ctx.db, c.rows.flatMap((r) => r.inputs.flatMap((i) => (isRowRef(i) ? [] : [i.asset]))));
+      const assetRows = loadAssetsById(
+        ctx.db,
+        [...c.rows.flatMap((r) => r.inputs), ...c.columns.flatMap((col) => col.inputs ?? [])].flatMap((i) => (isRef(i) ? [] : [i.asset])),
+      );
+      const dependencies = referencedCollections(ctx.db, slug);
       return {
         version: 1,
         collection: {
@@ -156,6 +190,7 @@ export function createCollectionService(ctx: ServiceContext) {
         columns: c.columns,
         rows: c.rows,
         assets: [...assetRows.values()].map(toAsset),
+        ...(dependencies.length > 0 ? { dependencies } : {}),
         exportedAt: nowIso(),
       };
     },
@@ -163,10 +198,13 @@ export function createCollectionService(ctx: ServiceContext) {
     import(document: CollectionExport, opts: { slug?: string; status?: CollectionStatus } = {}): CollectionView {
       const slug = opts.slug ?? document.collection.slug;
       transact(ctx, (tx, emit) => {
-        const needed = new Set(document.rows.flatMap((r) => r.inputs.flatMap((i) => (isRowRef(i) ? [] : [i.asset]))));
+        const needed = new Set([...document.rows.flatMap((r) => r.inputs), ...document.columns.flatMap((c) => c.inputs ?? [])].flatMap((i) => (isRef(i) ? [] : [i.asset])));
         const found = loadAssetsById(tx, needed);
         const missing = [...needed].filter((id) => !found.has(id));
         if (missing.length > 0) throw invalid(`referenced input assets are not present locally: ${missing.join(', ')}`);
+        for (const dep of document.dependencies ?? []) {
+          if (dep !== slug && !loadCollection(tx, dep)) throw invalid(`referenced collection ${dep} is not present locally`);
+        }
         insertCollectionTx(tx, emit, {
           slug,
           title: document.collection.title,
@@ -175,28 +213,38 @@ export function createCollectionService(ctx: ServiceContext) {
           defaults: document.collection.defaults,
         });
         const cols = [...document.columns].sort((a, b) => a.position - b.position);
-        for (const c of cols) addColumnTx(ctx, tx, emit, slug, { ...c, position: undefined }, true);
+        const from = document.collection.slug;
+        for (const c of cols) addColumnTx(ctx, tx, emit, slug, { ...c, position: undefined, ...(c.inputs ? { inputs: retarget(c.inputs, from, slug) } : {}) }, true, { skipChecks: true });
         const rs = [...document.rows].sort((a, b) => a.position - b.position);
         if (rs.length > 0) {
           addRowsTx(
             tx,
             emit,
             slug,
-            rs.map((r) => ({ ...r, position: undefined })),
-            { keepIds: rs.map((r) => r.id) },
+            rs.map((r) => ({ ...r, position: undefined, inputs: retarget(r.inputs, from, slug) })),
+            { keepIds: rs.map((r) => r.id), skipChecks: true },
           );
         }
+        const imported = requireCollection(tx, slug);
+        for (const c of imported.columns) assertReferenceTargets(tx, slug, { column: c.id }, c.inputs);
+        for (const r of imported.rows) assertReferenceTargets(tx, slug, { row: r.id }, r.inputs);
+        finishStructuralWrite(tx, slug);
       });
       return view(slug);
     },
 
-    /** Block until the collection's cursor moves past `cursor` (and no reconcile pass is pending), or timeout. */
-    async wait(slug: string, cursor: string, timeoutMs = 30_000): Promise<{ cursor: string; changed: boolean; inFlight: number; queued: number }> {
+    /**
+     * Block until the collection's cursor moves past `cursor` and no reconcile
+     * pass is pending for it or its upstream collections, or timeout. Returns
+     * the dependency-aware progress (DESIGN §5).
+     */
+    async wait(slug: string, cursor: string, timeoutMs = 30_000) {
       if (!loadCollection(ctx.db, slug)) throw notFound(`collection ${slug}`);
       const deadline = Date.now() + timeoutMs;
       let changed = false;
       for (;;) {
         await ctx.hooks.reconcileSettled?.(slug);
+        for (const up of referencedCollections(ctx.db, slug)) await ctx.hooks.reconcileSettled?.(up);
         if (ctx.bus.isPast(slug, cursor)) {
           changed = true;
           break;
@@ -205,13 +253,8 @@ export function createCollectionService(ctx: ServiceContext) {
         if (remaining <= 0) break;
         await ctx.bus.waitForChange(slug, remaining);
       }
-      const counts = ctx.db
-        .select({ status: generations.status })
-        .from(generations)
-        .where(and(eq(generations.collection, slug), inArray(generations.status, ['queued', 'submitting', 'running', 'downloading'])))
-        .all();
-      const queued = counts.filter((g) => g.status === 'queued').length;
-      return { cursor: ctx.bus.cursor(slug), changed, inFlight: counts.length - queued, queued };
+      const v = view(slug);
+      return { cursor: v.cursor, changed, inFlight: v.inFlight, queued: v.queued, progress: v.progress };
     },
 
     touch(slug: string): void {

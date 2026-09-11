@@ -76,9 +76,12 @@ export function createHandlers(services: Services, registry: ModelRegistry): Han
     'rows.duplicate': (i) => rows.duplicate(i.collection, i.row),
 
     'cells.get': (i) => cells.get(i.cell),
-    'cells.regenerate': (i) => cells.regenerate(i.cell),
+    'cells.regenerate': (i) => cells.regenerate(i.cell, { ...(i.holdCurrent !== undefined ? { holdCurrent: i.holdCurrent } : {}) }),
     'cells.retry': (i) => cells.retry(i.cell),
     'cells.cancel': (i) => cells.cancel(i.cell),
+    'cells.pin': (i) => cells.pin(i.cell, i),
+    'cells.unpin': (i) => cells.unpin(i.cell),
+    'cells.impact': (i) => cells.impact(i.cell, i.action),
 
     'generations.get': (i) => ({ generation: generations.get(i.generation) }),
 

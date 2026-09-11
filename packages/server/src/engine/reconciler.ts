@@ -3,6 +3,7 @@ import type { ModelRegistry } from '@imaginator/core';
 import type { ServerConfig } from '../config.js';
 import { collections, type GenerationRow } from '../db/schema.js';
 import type { EventBus } from '../events/bus.js';
+import { dependentClosure } from '../services/refs.js';
 import type { Services } from '../services/index.js';
 
 interface Pending {
@@ -12,11 +13,15 @@ interface Pending {
 }
 
 /**
- * Keeps live collections filled in (DESIGN §4.1). Debounced per collection
- * after collection/row/column events and after a generation succeeds (a cell
- * blocked on a row reference may now resolve), run at once on resume/unpause
- * and on boot, never on a timer. The DB work is one transaction in the reconcile
- * service; remote cancellation of superseded submitted work happens here.
+ * Keeps live collections filled in (DESIGN §4.1). Every source mutation and
+ * every generation transition dirties its collection and the transitive
+ * closure of collections that reference it (through the reference index);
+ * passes are debounced and coalesced per collection, run at once on
+ * resume/unpause and on boot, never on a timer. Derived events
+ * (`collection.invalidated` / `collection.reconciled`) are emitted here and
+ * never feed back into scheduling. The DB work is one transaction in the
+ * reconcile service; remote cancellation of superseded submitted work happens
+ * here.
  */
 export class Reconciler {
   private pending = new Map<string, Pending>();
@@ -37,14 +42,16 @@ export class Reconciler {
     this.stopped = false;
     this.unsubscribe = this.bus.on((e) => {
       if (!('collection' in e)) return;
-      if (e.type === 'collection.deleted') {
-        this.clearPending(e.collection);
-        return;
-      }
-      if (e.type === 'collection.created' || e.type === 'collection.updated' || e.type.startsWith('row.') || e.type.startsWith('column.')) {
-        this.schedule(e.collection);
-      } else if (e.type === 'generation.updated' && e.status === 'succeeded') {
-        this.schedule(e.collection);
+      switch (e.type) {
+        case 'collection.deleted':
+          this.clearPending(e.collection);
+          this.dirty(e.collection, true);
+          return;
+        case 'collection.invalidated':
+        case 'collection.reconciled':
+          return; // derived; never scheduling inputs
+        default:
+          this.dirty(e.collection);
       }
     });
   }
@@ -54,6 +61,26 @@ export class Reconciler {
     this.unsubscribe?.();
     for (const slug of [...this.pending.keys()]) this.clearPending(slug);
     await Promise.allSettled([...this.running.values(), ...this.background]);
+  }
+
+  /** Schedule the collection and every collection that transitively depends on it. */
+  dirty(slug: string, dependentsOnly = false): void {
+    if (this.stopped) return;
+    let affected: string[];
+    try {
+      affected = dependentClosure(this.services.ctx.db, [slug]);
+    } catch (e) {
+      this.config.log(`dependency closure of ${slug} failed: ${(e as Error).message}`);
+      affected = [slug];
+    }
+    for (const s of affected) {
+      if (s === slug) {
+        if (!dependentsOnly) this.schedule(s);
+        continue;
+      }
+      this.bus.emit({ type: 'collection.invalidated', collection: s });
+      this.schedule(s);
+    }
   }
 
   /** Debounced pass. */
@@ -72,17 +99,22 @@ export class Reconciler {
     return promise;
   }
 
-  /** Run a pass right away (cancels a pending debounce). */
+  /** Run a pass right away (cancels a pending debounce), for the collection and its dependents. */
   runNow(slug: string): Promise<void> {
     const p = this.pending.get(slug);
     if (p) {
       clearTimeout(p.timer);
       this.pending.delete(slug);
-      const run = this.run(slug);
-      run.finally(() => p.resolve());
-      return run;
     }
-    return this.run(slug);
+    const run = this.run(slug);
+    run.finally(() => p?.resolve());
+    this.dirty(slug, true);
+    return run;
+  }
+
+  /** A pass is pending or running for the collection. */
+  isPending(slug: string): boolean {
+    return this.pending.has(slug) || this.running.has(slug);
   }
 
   /** Resolves once no pass is pending or running for the collection. */
@@ -94,7 +126,7 @@ export class Reconciler {
     }
   }
 
-  /** Boot: one pass per collection. */
+  /** Boot: one pass per collection. References read whatever state exists; events chain the rest. */
   async bootPass(): Promise<void> {
     const slugs = this.services.ctx.db.select({ slug: collections.slug }).from(collections).orderBy(asc(collections.createdAt)).all();
     for (const { slug } of slugs) await this.run(slug);
@@ -133,10 +165,9 @@ export class Reconciler {
       this.config.log(`reconcile ${slug} failed: ${(e as Error).message}`);
       return;
     }
-    if (result.inserted.length === 0 && result.cancelled.length === 0) {
-      // Nothing changed: still move the cursor so `collections.wait` callers see the pass happened.
-      this.bus.touch(slug);
-    }
+    if (!this.services.collections.exists(slug)) return;
+    // Always announce the pass, so waiters and dependent views refresh even when nothing was inserted.
+    this.bus.emit({ type: 'collection.reconciled', collection: slug });
     for (const g of result.superseded) this.requestCancel(g);
   }
 

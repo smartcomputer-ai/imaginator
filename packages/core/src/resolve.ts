@@ -1,24 +1,53 @@
 import type { Asset, Column, CommonSettingsLike, Row, ResolvedRequest } from './resolve-types.js';
-import { isRowRef, type AssetInput, type GenerationStatus, type Input } from './domain.js';
+import { isRef, type AssetInput, type GenerationStatus, type Input } from './domain.js';
 import { stableStringify, type JsonObject } from './json.js';
 import { sha256Hex } from './sha256.js';
 import { COMMON_KEYS, canonicalRatio, commonSettingsSchema, type CommonKey, type CommonSettings } from './settings.js';
 import type { ModelRegistry } from './registry.js';
 import type { ModelSpec } from './provider.js';
-import type { AssetId, ColumnId, RowId } from './ids.js';
+import { cellKeyOf, formatCellLabel, type AssetId, type CellAddress, type ColumnId, type RowId } from './ids.js';
 
-/** What a row reference resolves to: the upstream cell's current outputs, or why it cannot yet. */
-export type Upstream = { outputs: AssetId[] } | { blocked: string };
-export type UpstreamLookup = (row: RowId, column: ColumnId) => Upstream;
+// ---------------------------------------------------------------------------
+// Templates
+// ---------------------------------------------------------------------------
+
+export const DEFAULT_PROMPT_TEMPLATE = '{prompt}';
+export const DEFAULT_NEGATIVE_TEMPLATE = '{negativePrompt}';
+
+/** Render a column template against a row. Only `{prompt}` and `{negativePrompt}` are substituted. */
+export function renderTemplate(template: string, row: { prompt: string; negativePrompt?: string }): string {
+  return template.replaceAll('{prompt}', row.prompt).replaceAll('{negativePrompt}', row.negativePrompt ?? '');
+}
+
+/** The prompt and negative prompt a cell asks for, after the column recipe. */
+export function renderPrompts(row: Row, column: Column): { prompt: string; negativePrompt: string | undefined } {
+  const prompt = renderTemplate(column.prompt ?? DEFAULT_PROMPT_TEMPLATE, row);
+  const negative = renderTemplate(column.negativePrompt ?? DEFAULT_NEGATIVE_TEMPLATE, row);
+  return { prompt, negativePrompt: negative === '' ? undefined : negative };
+}
+
+// ---------------------------------------------------------------------------
+// Inputs and references
+// ---------------------------------------------------------------------------
+
+export interface GridLike {
+  slug: string;
+  status?: 'live' | 'paused';
+  defaults: CommonSettingsLike;
+  rows: Row[];
+  columns: Column[];
+}
+
+/** What a reference resolves to: the source cell's current outputs, or why it cannot yet. */
+export type Upstream = { outputs: AssetId[] } | { blocked: string; pending: boolean };
+/** `origin` is the cell being resolved; reasons are phrased relative to it. */
+export type UpstreamLookup = (target: CellAddress, origin: CellAddress) => Upstream;
 
 export interface ResolveContext {
   registry: ModelRegistry;
   /** Lookup for input asset metadata; `undefined` = missing asset. */
   asset(id: AssetId): Asset | undefined;
-  /**
-   * Current outputs of another cell in the same collection, for row-reference
-   * inputs. Absent = every row reference is blocked.
-   */
+  /** Current outputs of other cells, for references. Absent = every reference is blocked. */
   upstream?: UpstreamLookup;
 }
 
@@ -30,47 +59,94 @@ export interface ResolveResult {
   /** Empty when the cell can run; otherwise the reasons it is `unsupported`. */
   unsupported: string[];
   /**
-   * Set when a row-reference input has no output yet (upstream missing, in
-   * flight, failed, ...). A blocked cell has no desired generation: nothing is
-   * inserted and `hash` matches nothing. The text says what it waits for.
+   * Set when a reference has no usable output yet and the cell would
+   * otherwise be runnable. A blocked cell has no desired generation: nothing
+   * is inserted and `hash` matches nothing. A cell that is unsupported on its
+   * own terms (too many inputs, a role the model rejects, ...) reports that
+   * instead, since no source could make it run.
    */
   blocked?: string;
+  /** With `blocked`: whether the source is expected to produce output on its own. */
+  pending?: boolean;
+  /** The row does not run in this column (sparse row). */
+  skipped?: boolean;
+  /** Cells this cell reads from, after anchors are filled in. */
+  precedents: CellAddress[];
 }
 
-/** Resolve a row's inputs: row references become asset inputs, or a reason they cannot. */
+/** The concrete cell a reference points at, from where it is written. */
+export function referenceTarget(input: { row?: RowId; column?: ColumnId; collection?: string }, origin: CellAddress): CellAddress {
+  return { collection: input.collection ?? origin.collection, row: input.row ?? origin.row, column: input.column ?? origin.column };
+}
+
+/** The input list a cell uses: the column's replacement list, or the row's. */
+export function effectiveInputs(row: Row, column: Column): { inputs: Input[]; placement: 'row' | 'column' } {
+  return column.inputs ? { inputs: column.inputs, placement: 'column' } : { inputs: row.inputs, placement: 'row' };
+}
+
+/** Concrete precedents of a cell, without resolving anything. */
+export function cellPrecedents(slug: string, row: Row, column: Column): CellAddress[] {
+  const origin = { collection: slug, row: row.id, column: column.id };
+  const out: CellAddress[] = [];
+  const seen = new Set<string>();
+  for (const input of effectiveInputs(row, column).inputs) {
+    if (!isRef(input)) continue;
+    const t = referenceTarget(input, origin);
+    const k = cellKeyOf(t);
+    if (!seen.has(k)) {
+      seen.add(k);
+      out.push(t);
+    }
+  }
+  return out;
+}
+
+/** Resolve a cell's inputs: references become asset inputs, or a reason they cannot. */
 export function resolveInputs(
+  slug: string,
   row: Row,
   column: Column,
   upstream: UpstreamLookup | undefined,
-): { inputs: AssetInput[]; content: JsonObject[]; blocked: string[] } {
+): { inputs: AssetInput[]; content: JsonObject[]; blocked: string[]; pending: boolean; precedents: CellAddress[] } {
+  const origin: CellAddress = { collection: slug, row: row.id, column: column.id };
   const inputs: AssetInput[] = [];
   const content: JsonObject[] = [];
   const blocked: string[] = [];
-  for (const input of row.inputs) {
+  const precedents: CellAddress[] = [];
+  let pending = false;
+  for (const input of effectiveInputs(row, column).inputs) {
     const rest = { role: input.role, ...(input.maskFor !== undefined ? { maskFor: input.maskFor } : {}) };
     let asset: AssetId | undefined;
-    if (!isRowRef(input)) {
+    if (!isRef(input)) {
       asset = input.asset;
     } else {
-      const up = upstream ? upstream(input.row, column.id) : { blocked: `waiting for ${input.row}` };
+      const target = referenceTarget(input, origin);
+      precedents.push(target);
+      const label = formatCellLabel(target, origin);
+      const up = upstream ? upstream(target, origin) : { blocked: `waiting for ${label}`, pending: true };
       if ('blocked' in up) {
         blocked.push(up.blocked);
+        pending ||= up.pending;
       } else if (up.outputs[input.output ?? 0] === undefined) {
-        blocked.push(`${input.row} has no output #${input.output ?? 0}`);
+        blocked.push(`${label} has no output #${input.output ?? 0}`);
       } else {
         asset = up.outputs[input.output ?? 0];
       }
+      if (asset === undefined) {
+        // Placeholder so a blocked cell's hash never matches a real generation.
+        content.push({ ref: cellKeyOf(target), output: input.output ?? 0, role: input.role, maskFor: input.maskFor ?? null });
+        continue;
+      }
     }
-    if (asset !== undefined) {
-      inputs.push({ asset, ...rest });
-      content.push({ asset, role: input.role, maskFor: input.maskFor ?? null });
-    } else if (isRowRef(input)) {
-      // Placeholder so a blocked cell's hash never matches a real generation.
-      content.push({ ref: input.row, output: input.output ?? 0, role: input.role, maskFor: input.maskFor ?? null });
-    }
+    inputs.push({ asset, ...rest });
+    content.push({ asset, role: input.role, maskFor: input.maskFor ?? null });
   }
-  return { inputs, content, blocked: dedupe(blocked) };
+  return { inputs, content, blocked: dedupe(blocked), pending, precedents };
 }
+
+// ---------------------------------------------------------------------------
+// Settings
+// ---------------------------------------------------------------------------
 
 /**
  * Merge collection defaults with row settings, then drop keys the model does
@@ -96,25 +172,28 @@ export function mergeCommonSettings(
   return { common: common as CommonSettings, dropped };
 }
 
+// ---------------------------------------------------------------------------
+// Content and hash
+// ---------------------------------------------------------------------------
+
 /**
- * `content()` from DESIGN §4.1: what the user wrote, with unhonored common
- * keys removed. Registry defaults and anything resolve() adds are excluded.
+ * `content()` from DESIGN §4.1: what the cell asks for, with unhonored common
+ * keys removed. Templates and references are hashed by what they resolve to.
  */
-export function cellContent(
-  collection: { defaults: CommonSettingsLike },
-  row: Row,
-  column: Column,
-  spec: ModelSpec | undefined,
-  upstream?: UpstreamLookup,
-): JsonObject {
+export function cellContent(collection: GridLike, row: Row, column: Column, spec: ModelSpec | undefined, upstream?: UpstreamLookup): JsonObject {
+  return contentWithInputs(collection, row, column, spec, resolveInputs(collection.slug, row, column, upstream).content);
+}
+
+function contentWithInputs(collection: GridLike, row: Row, column: Column, spec: ModelSpec | undefined, inputs: JsonObject[]): JsonObject {
   const { common } = mergeCommonSettings(collection.defaults, row.settings, spec);
+  const prompts = renderPrompts(row, column);
   return {
     model: column.model,
     columnSettings: (column.settings ?? {}) as JsonObject,
     count: column.count,
-    prompt: row.prompt,
-    negativePrompt: row.negativePrompt ?? null,
-    inputs: resolveInputs(row, column, upstream).content,
+    prompt: prompts.prompt,
+    negativePrompt: prompts.negativePrompt ?? null,
+    inputs,
     common: common as JsonObject,
   };
 }
@@ -123,31 +202,26 @@ export function hashContent(content: JsonObject): string {
   return sha256Hex(stableStringify(content));
 }
 
-export function cellHash(
-  collection: { defaults: CommonSettingsLike },
-  row: Row,
-  column: Column,
-  spec: ModelSpec | undefined,
-  upstream?: UpstreamLookup,
-): string {
+export function cellHash(collection: GridLike, row: Row, column: Column, spec: ModelSpec | undefined, upstream?: UpstreamLookup): string {
   return hashContent(cellContent(collection, row, column, spec, upstream));
+}
+
+export function isSkipped(row: Row, column: Column): boolean {
+  return row.columns !== undefined && !row.columns.includes(column.id);
 }
 
 /**
  * Resolve a cell into a request snapshot plus its hash, and decide whether the
  * (row, column) pair is supported by the column's model. Pure.
  */
-export function resolveCell(
-  collection: { defaults: CommonSettingsLike },
-  row: Row,
-  column: Column,
-  ctx: ResolveContext,
-): ResolveResult {
+export function resolveCell(collection: GridLike, row: Row, column: Column, ctx: ResolveContext): ResolveResult {
   const spec = ctx.registry.get(column.model);
-  const hash = cellHash(collection, row, column, spec, ctx.upstream);
+  const resolvedInputs = resolveInputs(collection.slug, row, column, ctx.upstream);
+  const hash = hashContent(contentWithInputs(collection, row, column, spec, resolvedInputs.content));
   const { common, dropped } = mergeCommonSettings(collection.defaults, row.settings, spec);
-  const resolvedInputs = resolveInputs(row, column, ctx.upstream);
-  const blocked = resolvedInputs.blocked.length > 0 ? { blocked: resolvedInputs.blocked.join('; ') } : {};
+  const prompts = renderPrompts(row, column);
+  const skipped = isSkipped(row, column) ? { skipped: true as const } : {};
+  const blocked = resolvedInputs.blocked.length > 0 ? { blocked: resolvedInputs.blocked.join('; '), pending: resolvedInputs.pending } : {};
   const unsupported: string[] = [];
 
   // Column settings: fill registry defaults, validate against the model schema.
@@ -165,8 +239,8 @@ export function resolveCell(
 
   const request: ResolvedRequest = {
     model: column.model,
-    prompt: row.prompt,
-    ...(row.negativePrompt !== undefined ? { negativePrompt: row.negativePrompt } : {}),
+    prompt: prompts.prompt,
+    ...(prompts.negativePrompt !== undefined ? { negativePrompt: prompts.negativePrompt } : {}),
     inputs: resolvedInputs.inputs,
     count: column.count,
     common,
@@ -174,9 +248,10 @@ export function resolveCell(
     droppedKeys: dropped,
     registryVersion: ctx.registry.version,
   };
+  const precedents = resolvedInputs.precedents;
 
   if (!spec) {
-    return { hash, request, unsupported: [`unknown model ${column.model}`], ...blocked };
+    return { hash, request, unsupported: [`unknown model ${column.model}`], precedents, ...blocked, ...skipped };
   }
   const caps = spec.capabilities;
 
@@ -202,13 +277,12 @@ export function resolveCell(
   if (column.count > caps.count) {
     unsupported.push(`count ${column.count} exceeds the model maximum of ${caps.count}`);
   }
-  if (row.negativePrompt !== undefined && row.negativePrompt !== '' && !caps.negativePrompt) {
+  if (prompts.negativePrompt !== undefined && !caps.negativePrompt) {
     unsupported.push('model does not support a negative prompt');
   }
 
-  const inputAssets: Asset[] = [];
-  const missing: string[] = [];
-  for (const input of row.inputs) {
+  const effective = effectiveInputs(row, column).inputs;
+  for (const input of effective) {
     if (!caps.inputRoles.includes(input.role)) {
       unsupported.push(
         caps.inputRoles.length === 0
@@ -217,13 +291,20 @@ export function resolveCell(
       );
     }
   }
+  const inputAssets: Asset[] = [];
+  const missing: string[] = [];
   for (const input of resolvedInputs.inputs) {
     const asset = ctx.asset(input.asset);
     if (!asset) missing.push(input.asset);
     else inputAssets.push(asset);
   }
-  if (row.inputs.length > caps.maxInputImages) {
-    unsupported.push(`${row.inputs.length} inputs exceed the model maximum of ${caps.maxInputImages}`);
+  if (effective.length > caps.maxInputImages) {
+    unsupported.push(`${effective.length} inputs exceed the model maximum of ${caps.maxInputImages}`);
+  }
+  const min = caps.minInputImages ?? 0;
+  const images = effective.filter((i) => i.role !== 'mask').length;
+  if (min > 0 && images < min) {
+    unsupported.push(min === 1 ? 'model requires an input image (an edit-only model): add a reference or a frozen asset' : `model requires at least ${min} input images`);
   }
   if (missing.length > 0) unsupported.push(`input asset(s) not found: ${missing.join(', ')}`);
 
@@ -231,75 +312,106 @@ export function resolveCell(
     unsupported.push(...spec.validateRequest(request, inputAssets));
   }
 
-  return { hash, request, unsupported: dedupe(unsupported), ...blocked };
+  // Unsupported on its own terms beats blocked: the reason the user can act on is the structural one.
+  return { hash, request, unsupported: dedupe(unsupported), precedents, ...(unsupported.length === 0 ? blocked : {}), ...skipped };
+}
+
+function dedupe(list: string[]): string[] {
+  return [...new Set(list)];
 }
 
 // ---------------------------------------------------------------------------
-// Grid resolution: cells in dependency order
+// Workbook resolution: cells across collections, in dependency order
 // ---------------------------------------------------------------------------
 
-export interface GridGeneration {
-  status: GenerationStatus;
-  outputs: AssetId[];
+/** What the resolver needs to know about a source cell for a given desired hash. */
+export interface CellState {
+  /** Outputs of the current *success* (pinned, else newest succeeded) with this hash. */
+  outputs?: AssetId[];
+  /** Status of the newest non-cancelled attempt with this hash, if any. */
+  latestStatus?: GenerationStatus;
+  /** Its error message, when it has one (surfaced in dependents' blocked reasons). */
+  latestError?: string;
+  /** An explicit cancellation hold applies to this hash. */
+  held?: boolean;
 }
 
-export interface GridResolveContext {
+export interface WorkbookContext {
   registry: ModelRegistry;
   asset(id: AssetId): Asset | undefined;
-  /** The newest non-cancelled generation of the cell with exactly this hash, if any. */
-  generation(row: RowId, column: ColumnId, hash: string): GridGeneration | undefined;
+  /** Load a collection by slug; `undefined` when it does not exist. Called lazily, memoized by the resolver. */
+  grid(slug: string): GridLike | undefined;
+  /** The state of a cell for exactly this desired hash. */
+  cell(target: CellAddress, hash: string): CellState;
 }
 
-export interface GridLike {
-  defaults: CommonSettingsLike;
-  rows: Row[];
-  columns: Column[];
+export interface WorkbookResolver {
+  /** Resolve a cell; `undefined` when the collection, row, or column does not exist. */
+  resolve(target: CellAddress): ResolveResult | undefined;
+  grid(slug: string): GridLike | undefined;
 }
 
 /**
- * Resolve every cell of a collection, following row references to the
- * upstream cell's *current* generation (newest non-cancelled with the desired
- * hash). Memoized; a reference cycle or unknown row blocks instead of looping.
+ * Resolve any cell of any collection, following references to the source
+ * cell's current success. Memoized; a reference cycle or unknown target
+ * blocks instead of looping.
  */
-export function createGridResolver(collection: GridLike, ctx: GridResolveContext): (row: RowId, column: ColumnId) => ResolveResult {
-  const rows = new Map(collection.rows.map((r) => [r.id, r]));
-  const columns = new Map(collection.columns.map((c) => [c.id, c]));
-  const memo = new Map<string, ResolveResult>();
+export function createWorkbookResolver(ctx: WorkbookContext): WorkbookResolver {
+  const grids = new Map<string, GridLike | undefined>();
+  const memo = new Map<string, ResolveResult | undefined>();
   const visiting = new Set<string>();
 
-  const upstream: UpstreamLookup = (rowId, columnId) => {
-    const row = rows.get(rowId);
-    if (!row) return { blocked: `row ${rowId} not found` };
-    const key = `${rowId} ${columnId}`;
-    if (visiting.has(key)) return { blocked: `${rowId} references itself` };
-    const resolved = resolve(rowId, columnId);
-    if (resolved.blocked) return { blocked: `${rowId}: ${resolved.blocked}` };
-    const g = ctx.generation(rowId, columnId, resolved.hash);
-    if (!g) return { blocked: `waiting for ${rowId}` };
-    switch (g.status) {
-      case 'succeeded':
-        return { outputs: g.outputs };
-      case 'failed':
-        return { blocked: `${rowId} failed` };
-      case 'unsupported':
-        return { blocked: `${rowId} is unsupported` };
-      case 'needs_attention':
-        return { blocked: `${rowId} needs attention` };
-      default:
-        return { blocked: `waiting for ${rowId}` };
-    }
+  const grid = (slug: string): GridLike | undefined => {
+    if (!grids.has(slug)) grids.set(slug, ctx.grid(slug));
+    return grids.get(slug);
   };
 
-  function resolve(rowId: RowId, columnId: ColumnId): ResolveResult {
-    const key = `${rowId} ${columnId}`;
-    const cached = memo.get(key);
-    if (cached) return cached;
-    const row = rows.get(rowId);
-    const column = columns.get(columnId);
-    if (!row || !column) throw new Error(`no cell ${rowId}/${columnId}`);
+  const upstream: UpstreamLookup = (target, origin) => {
+    const label = formatCellLabel(target, origin);
+    const g = grid(target.collection);
+    if (!g) return { blocked: `collection ${target.collection} not found`, pending: false };
+    const row = g.rows.find((r) => r.id === target.row);
+    const column = g.columns.find((c) => c.id === target.column);
+    if (!row || !column) return { blocked: `${label} not found`, pending: false };
+    if (visiting.has(cellKeyOf(target))) return { blocked: `${label} references itself (cycle)`, pending: false };
+    const resolved = resolve(target)!;
+    if (resolved.skipped) return { blocked: `${label} is skipped`, pending: false };
+    if (resolved.blocked) return { blocked: `${label}: ${resolved.blocked}`, pending: resolved.pending ?? false };
+    const state = ctx.cell(target, resolved.hash);
+    if (state.outputs) return { outputs: state.outputs };
+    // The source's own reason lives on the source; here it is enough to point at it.
+    switch (state.latestStatus) {
+      case 'failed':
+      case 'unsupported':
+      case 'needs_attention':
+        return { blocked: `${label} cannot produce an output (${state.latestStatus.replace('_', ' ')}); see that cell`, pending: false };
+      case 'queued':
+      case 'submitting':
+      case 'running':
+      case 'downloading':
+        return { blocked: `waiting for ${label}`, pending: true };
+      default:
+        break;
+    }
+    if (resolved.unsupported.length > 0) return { blocked: `${label} cannot produce an output (unsupported); see that cell`, pending: false };
+    if (state.held) return { blocked: `${label} was cancelled`, pending: false };
+    if (g.status === 'paused' || row.paused) return { blocked: `${label} is paused and needs generation`, pending: false };
+    return { blocked: `waiting for ${label}`, pending: true };
+  };
+
+  function resolve(target: CellAddress): ResolveResult | undefined {
+    const key = cellKeyOf(target);
+    if (memo.has(key)) return memo.get(key);
+    const g = grid(target.collection);
+    const row = g?.rows.find((r) => r.id === target.row);
+    const column = g?.columns.find((c) => c.id === target.column);
+    if (!g || !row || !column) {
+      memo.set(key, undefined);
+      return undefined;
+    }
     visiting.add(key);
     try {
-      const result = resolveCell(collection, row, column, { registry: ctx.registry, asset: ctx.asset, upstream });
+      const result = resolveCell(g, row, column, { registry: ctx.registry, asset: ctx.asset, upstream });
       memo.set(key, result);
       return result;
     } finally {
@@ -307,14 +419,10 @@ export function createGridResolver(collection: GridLike, ctx: GridResolveContext
     }
   }
 
-  return resolve;
+  return { resolve, grid };
 }
 
-/** Row ids referenced by a row's inputs (deduplicated). */
+/** Row ids referenced by a row's inputs (deduplicated); same-collection references only. */
 export function referencedRows(inputs: Input[]): RowId[] {
-  return dedupe(inputs.filter(isRowRef).map((i) => i.row));
-}
-
-function dedupe(list: string[]): string[] {
-  return [...new Set(list)];
+  return dedupe(inputs.flatMap((i) => (isRef(i) && i.row !== undefined && i.collection === undefined ? [i.row] : [])));
 }

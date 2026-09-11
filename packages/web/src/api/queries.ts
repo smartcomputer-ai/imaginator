@@ -19,6 +19,7 @@ export const keys = {
   collection: (slug: string) => ['collection', slug] as const,
   cell: (address: string) => ['cell', address] as const,
   generation: (ref: string) => ['generation', ref] as const,
+  impact: (address: string, action: string) => ['impact', address, action] as const,
   assets: (filters: CommandInput<'assets.list'> = {}) => ['assets', filters] as const,
   models: ['models'] as const,
 };
@@ -30,7 +31,7 @@ export function invalidateCollection(qc: QueryClient, slug: string): void {
   void qc.invalidateQueries({
     predicate: (q) => {
       const [kind, id] = q.queryKey as [string, string | undefined];
-      return (kind === 'cell' || kind === 'generation') && typeof id === 'string' && id.startsWith(`${slug}/`);
+      return (kind === 'cell' || kind === 'generation' || kind === 'impact') && typeof id === 'string' && id.startsWith(`${slug}/`);
     },
   });
 }
@@ -75,6 +76,16 @@ export function useGeneration(ref: string | undefined) {
     queryKey: keys.generation(ref ?? ''),
     queryFn: () => call('generations.get', { generation: ref! }),
     enabled: !!ref,
+  });
+}
+
+/** Read-only cascade preview for a cell action (DESIGN §4.1). */
+export function useImpact(address: string | undefined, action: 'regenerate' | 'retry' | 'pin' | 'unpin' = 'regenerate') {
+  return useQuery({
+    queryKey: keys.impact(address ?? '', action),
+    queryFn: () => call('cells.impact', { cell: address!, action }),
+    enabled: !!address,
+    staleTime: 5_000,
   });
 }
 
@@ -131,7 +142,9 @@ function afterSuccess<N extends CommandName>(qc: QueryClient, name: N, input: Co
       return;
     case 'cells.regenerate':
     case 'cells.retry':
-    case 'cells.cancel': {
+    case 'cells.cancel':
+    case 'cells.pin':
+    case 'cells.unpin': {
       const cell = typeof inp.cell === 'string' ? inp.cell : '';
       const cellSlug = cell.split('/')[0];
       if (cellSlug) invalidateCollection(qc, cellSlug);

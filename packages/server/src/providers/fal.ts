@@ -223,6 +223,8 @@ export interface FalModelDef {
   size: SizeMode;
   images: ImageInputMode;
   inputRoles: InputRole[];
+  /** Images the endpoint cannot run without (edit-only endpoints); default 0. */
+  minImages?: number;
   /** Max `num_images`; 1 when the endpoint has no such field. */
   maxImages: number;
   seed: boolean;
@@ -287,6 +289,7 @@ export const FAL_MODELS: readonly FalModelDef[] = [
     size: { kind: 'aspect_ratio', ratios: ['21:9', '16:9', '4:3', '3:2', '1:1', '2:3', '3:4', '9:16', '9:21'] },
     images: { kind: 'single', field: 'image_url', max: 1 },
     inputRoles: ['init', 'reference'],
+    minImages: 1,
     maxImages: 4,
     seed: true,
     negativePrompt: false,
@@ -320,6 +323,7 @@ export const FAL_MODELS: readonly FalModelDef[] = [
     size: { kind: 'image_size', custom: { min: 256, max: 2560, step: 16 } },
     images: { kind: 'multi', field: 'image_urls', max: 10 },
     inputRoles: ['init', 'reference'],
+    minImages: 1,
     maxImages: 1,
     seed: true,
     negativePrompt: false,
@@ -422,6 +426,7 @@ export const FAL_MODELS: readonly FalModelDef[] = [
     },
     images: { kind: 'multi', field: 'image_urls', max: 10 },
     inputRoles: ['init', 'reference'],
+    minImages: 1,
     maxImages: 4,
     seed: true,
     negativePrompt: false,
@@ -642,6 +647,7 @@ function validateRequestFor(def: FalModelDef, req: ResolvedRequest, inputs: Asse
   if (def.images.kind !== 'none' && images.length > def.images.max) {
     errors.push(`${images.length} input images exceed the model maximum of ${def.images.max}`);
   }
+  if (def.minImages && images.length < def.minImages) errors.push(`model requires ${def.minImages === 1 ? 'an input image' : `at least ${def.minImages} input images`}`);
   for (const a of inputs) {
     if (a.kind !== 'image' || !(IMAGE_MIMES as readonly string[]).includes(a.mime)) errors.push(`input ${a.id} is ${a.mime}; fal models accept png, jpeg, webp`);
   }
@@ -656,6 +662,7 @@ function specFor(def: FalModelDef): ModelSpec {
   const caps: ModelSpec['capabilities'] = {
     inputRoles: def.inputRoles,
     maxInputImages: def.images.kind === 'none' ? 0 : def.images.max,
+    ...(def.minImages !== undefined ? { minInputImages: def.minImages } : {}),
     negativePrompt: def.negativePrompt,
     commonKeys,
     count: def.maxImages,

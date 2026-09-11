@@ -23,6 +23,12 @@ export type ImaginatorEvent =
   | { type: 'collection.created'; collection: CollectionSlug; cursor: Cursor }
   | { type: 'collection.updated'; collection: CollectionSlug; cursor: Cursor }
   | { type: 'collection.deleted'; collection: CollectionSlug; cursor: Cursor }
+  /** Derived: a pass was scheduled for this collection because something it depends on changed. */
+  | { type: 'collection.invalidated'; collection: CollectionSlug; cursor: Cursor }
+  /** Derived: a reconcile pass finished (even if it inserted nothing). */
+  | { type: 'collection.reconciled'; collection: CollectionSlug; cursor: Cursor }
+  /** Cell metadata changed: a pin or an execution hold. */
+  | { type: 'cell.updated'; collection: CollectionSlug; row: RowId; column: ColumnId; cursor: Cursor }
   | { type: 'row.updated'; collection: CollectionSlug; row: RowId; cursor: Cursor }
   | { type: 'row.deleted'; collection: CollectionSlug; row: RowId; cursor: Cursor }
   | { type: 'column.updated'; collection: CollectionSlug; column: ColumnId; cursor: Cursor }

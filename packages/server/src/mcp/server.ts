@@ -94,7 +94,9 @@ Typical loop:
 4. get_collection for the grid as data, then view_images (cell addresses, asset ids or generation refs) to actually look at results; get_cell for one cell with its version history.
 5. Iterate: update_row changes a prompt (only that row regenerates), regenerate_cell asks for another sample, retry_cell re-runs a failed or unsupported cell.
 
-Follow-up edits: give a row an input of { row: "r3", role: "init" } and its cell in each column edits that column's current output of r3, so a chain of edits reads top to bottom per model. Blocked cells wait for the referenced row.
+References (live inputs): an input may be a frozen asset ({ asset, role }) or a reference to another cell's current output. On a row, { row: "r3", role } means "r3 in the same column" (a follow-up edit, one chain per model); { row: "r1", column: "flux" } pins one base for every column; { collection, row, column } reads another collection. The string form { ref: "r3" | "r3/flux" | "coll/r3/flux", role } is accepted too. A column recipe (update_column: prompt template with {prompt}, negativePrompt template, inputs such as [{ column: "flux", role: "init" }] meaning "same row, flux's output") turns a column into a pipeline stage applied to every row. Blocked cells wait for their sources; a pin (pin_cell) holds a cell's selected output while you sample more; a sparse row (update_row columns) runs only in some columns.
+
+Progress: wait_for_collection returns progress.state running | blocked | settled plus attention lists. Loop while running; on blocked, fix or report the listed sources; on settled, read attention.failed/unsupported/needsAttention (allSucceeded = settled with none).
 
 Addresses: cells are collection/row/column (neon-cats/r3/flux-pro), generations are collection/row/column#version or a 6-character id, assets are 6-character ids usable as row inputs (upload_asset or a previous output). Resources mirror the same data: imaginator://collections/{slug} (JSON), imaginator://assets/{id} (image) and imaginator://assets/{id}/thumb.`;
 
@@ -408,7 +410,8 @@ export function createMcpServer(deps: McpDeps, options: McpServerOptions): McpSe
     'update_column',
     {
       title: 'Update column',
-      description: 'Change a column: rename (id), model, model settings (replaced wholesale; null clears), or count. Cells whose request changes regenerate.',
+      description:
+        'Change a column: rename (id), model, model settings (replaced wholesale; null clears), count, or its recipe. Recipe: prompt template ("{prompt}" = row prompt; a literal instruction ignores it), negativePrompt template ("" drops the row negative prompt), inputs (null = inherit the row inputs; a list replaces them, e.g. [{ column: "flux", role: "init" }] = same row, flux output: a pipeline stage). Cells whose request changes regenerate.',
       input: z.object({
         collection: collectionArg,
         column: columnIdSchema,
@@ -416,6 +419,9 @@ export function createMcpServer(deps: McpDeps, options: McpServerOptions): McpSe
         model: modelIdSchema.optional(),
         settings: modelSettingsSchema.nullable().optional(),
         count: z.number().int().min(1).optional(),
+        prompt: z.string().nullable().optional(),
+        negativePrompt: z.string().nullable().optional(),
+        inputs: commandDefs['columns.update'].input.shape.inputs,
       }),
       output: commandDefs['columns.update'].output,
       annotations: IDEMPOTENT_WRITE,
@@ -455,7 +461,7 @@ export function createMcpServer(deps: McpDeps, options: McpServerOptions): McpSe
     {
       title: 'Update row',
       description:
-        'Change a row. Only that row regenerates (plus rows that reference it), and only in columns where the resolved request changed. Nullable fields set to null are cleared; inputs and settings are replaced wholesale. paused=true stops the row from generating.',
+        'Change a row. Only that row regenerates (plus cells that reference it), and only in columns where the resolved request changed. Nullable fields set to null are cleared; inputs and settings are replaced wholesale. columns = sparse row (run only in these columns; null = all). paused=true stops the row from submitting new work; its existing outputs stay usable.',
       input: z.object({
         collection: collectionArg,
         row: rowIdSchema,
@@ -463,6 +469,7 @@ export function createMcpServer(deps: McpDeps, options: McpServerOptions): McpSe
         negativePrompt: z.string().nullable().optional(),
         inputs: rowInputSchema.shape.inputs,
         settings: commonSettingsSchema.nullable().optional(),
+        columns: z.array(columnIdSchema).nullable().optional(),
         notes: z.string().nullable().optional(),
         paused: z.boolean().optional(),
       }),
@@ -495,18 +502,13 @@ export function createMcpServer(deps: McpDeps, options: McpServerOptions): McpSe
 
   // -- cells / generations ---------------------------------------------------------------------
 
-  const cellOutput = z.object({
-    cell: cellViewSchema,
-    current: generationSchema.optional(),
-    versions: z.array(commandDefs['cells.get'].output.shape.versions.element),
-    ...cursorOut,
-  });
+  const cellOutput = commandDefs['cells.get'].output;
 
   tool(
     'get_cell',
     {
       title: 'Get cell',
-      description: 'One cell: current generation (request snapshot, error, timing), its version history, and by default the current output image(s).',
+      description: 'One cell: current success, latest attempt, version history, the cells it reads from (precedents) and feeds (dependents), and by default the current output image(s).',
       input: z.object({
         cell: cellArg,
         images: z.boolean().optional().describe('Inline the current outputs. Default true.'),
@@ -594,8 +596,9 @@ export function createMcpServer(deps: McpDeps, options: McpServerOptions): McpSe
     'regenerate_cell',
     {
       title: 'Regenerate cell',
-      description: '"Give me another one": queue a fresh sample of the same request. The previous result stays in the version history.',
-      input: z.object({ cell: cellArg }),
+      description:
+        '"Give me another one": queue a fresh sample of the same request. The previous result stays in the version history and stays current until the new sample succeeds. holdCurrent=true pins the current success first so dependents do not move; use preview_cell_impact to see what would.',
+      input: z.object({ cell: cellArg, holdCurrent: z.boolean().optional() }),
       output: commandDefs['cells.regenerate'].output,
       annotations: WRITE,
     },
@@ -603,10 +606,46 @@ export function createMcpServer(deps: McpDeps, options: McpServerOptions): McpSe
   );
 
   tool(
+    'pin_cell',
+    {
+      title: 'Pin cell',
+      description: 'Pin a successful version as the cell\'s current output (default: the current success). Dependents build on the pinned version until you pin another or unpin. Only a version matching the current content can be pinned.',
+      input: z.object({ cell: cellArg, version: z.number().int().min(1).optional() }),
+      output: commandDefs['cells.pin'].output,
+      annotations: IDEMPOTENT_WRITE,
+    },
+    async (input) => ok(await run('cells.pin', input)),
+  );
+
+  tool(
+    'unpin_cell',
+    {
+      title: 'Unpin cell',
+      description: 'Remove the pin: the newest matching success becomes current again and dependents follow it.',
+      input: z.object({ cell: cellArg }),
+      output: commandDefs['cells.unpin'].output,
+      annotations: IDEMPOTENT_WRITE,
+    },
+    async (input) => ok(await run('cells.unpin', input)),
+  );
+
+  tool(
+    'preview_cell_impact',
+    {
+      title: 'Preview cell impact',
+      description: 'Read-only: which cells and collections a regenerate, retry, pin, or unpin on this cell could cascade into, plus paused scopes and pins in the way. Potential work, not an exact count.',
+      input: z.object({ cell: cellArg, action: z.enum(['regenerate', 'retry', 'pin', 'unpin']).optional() }),
+      output: commandDefs['cells.impact'].output,
+      annotations: READ,
+    },
+    async (input) => ok(await run('cells.impact', input)),
+  );
+
+  tool(
     'retry_cell',
     {
       title: 'Retry cell',
-      description: 'Retry a failed, unsupported, or needs_attention cell with a fresh generation. Failed cells never retry on their own.',
+      description: 'Retry the latest failed, unsupported, or needs_attention attempt of a cell (or release an explicit cancel). Failed cells never retry on their own; an older success stays current meanwhile.',
       input: z.object({ cell: cellArg }),
       output: commandDefs['cells.retry'].output,
       annotations: WRITE,
@@ -618,7 +657,7 @@ export function createMcpServer(deps: McpDeps, options: McpServerOptions): McpSe
     'cancel_cell',
     {
       title: 'Cancel cell',
-      description: 'Cancel the in-flight generation of a cell, if any.',
+      description: 'Cancel the in-flight generation of a cell and hold it: the cancelled request is not recreated until retry_cell or regenerate_cell.',
       input: z.object({ cell: cellArg }),
       output: commandDefs['cells.cancel'].output,
       annotations: IDEMPOTENT_WRITE,

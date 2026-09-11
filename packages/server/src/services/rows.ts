@@ -1,9 +1,10 @@
 import { and, asc, eq, inArray } from 'drizzle-orm';
-import { isActiveStatus, isRowRef, referencedRows, type Input, type Row, type RowInput } from '@imaginator/core';
+import { isActiveStatus, isRef, referenceTarget, type Input, type Row, type RowInput } from '@imaginator/core';
 import type { Tx } from '../db/index.js';
-import { collections, generations, rows } from '../db/schema.js';
-import { conflict, invalid, notFound } from '../errors.js';
-import { loadAssetsById, requireCollection, requireRowRow, toRow, touchCollection, transact, type Emit, type ServiceContext } from './context.js';
+import { collections, columns, generations, rows } from '../db/schema.js';
+import { invalid, notFound } from '../errors.js';
+import { loadAssetsById, loadCollection, requireCollection, requireRowRow, toRow, touchCollection, transact, type Emit, type ServiceContext } from './context.js';
+import { assertNoCycles, assertUnreferenced, rewriteRefs } from './refs.js';
 
 function orderedIds(tx: Tx, slug: string): string[] {
   return tx.select({ id: rows.id }).from(rows).where(eq(rows.collection, slug)).orderBy(asc(rows.position), asc(rows.id)).all().map((r) => r.id);
@@ -15,46 +16,65 @@ function renumber(tx: Tx, slug: string, order: string[]): void {
   });
 }
 
-function assertAssetsExist(tx: Tx, inputs: Input[] | undefined): void {
-  const ids = (inputs ?? []).flatMap((i) => (isRowRef(i) ? [] : [i.asset]));
+export function assertAssetsExist(tx: Tx, inputs: Input[] | undefined): void {
+  const ids = (inputs ?? []).flatMap((i) => (isRef(i) ? [] : [i.asset]));
   if (ids.length === 0) return;
   const found = loadAssetsById(tx, ids);
   const missing = ids.filter((id) => !found.has(id));
   if (missing.length > 0) throw invalid(`input asset(s) not found: ${[...new Set(missing)].join(', ')}`);
 }
 
-/** Row id → ids it references, for every row in the collection. */
-function referenceGraph(tx: Tx, slug: string): Map<string, string[]> {
-  const list = tx.select({ id: rows.id, inputs: rows.inputs }).from(rows).where(eq(rows.collection, slug)).all();
-  return new Map(list.map((r) => [r.id, referencedRows(r.inputs)]));
-}
-
 /**
- * Row references must point at rows of the same collection (existing, or
- * earlier in the same batch), never at the row itself, and never form a cycle.
- * `graph` is the collection's reference graph with this batch applied.
+ * Every reference must point at a cell that exists: the row, the column when
+ * named, and the collection when named. Same-collection targets may also be
+ * rows or columns created earlier in the same batch (`extra`). A cell may not
+ * reference itself.
  */
-function assertReferencesValid(graph: Map<string, string[]>, rowId: string, inputs: Input[] | undefined): void {
-  for (const ref of referencedRows(inputs ?? [])) {
-    if (ref === rowId) throw invalid(`row ${rowId} cannot reference itself`);
-    if (!graph.has(ref)) throw invalid(`referenced row ${ref} not found`);
-  }
-  // Walk downstream from the referenced rows; reaching rowId again is a cycle.
-  const stack = [...referencedRows(inputs ?? [])];
-  const seen = new Set<string>();
-  while (stack.length > 0) {
-    const id = stack.pop()!;
-    if (seen.has(id)) continue;
-    seen.add(id);
-    for (const next of graph.get(id) ?? []) {
-      if (next === rowId) throw invalid(`row ${rowId} and row ${id} would reference each other`);
-      stack.push(next);
+export function assertReferenceTargets(
+  tx: Tx,
+  slug: string,
+  origin: { row?: string; column?: string },
+  inputs: Input[] | undefined,
+  extra: { rows?: string[]; columns?: string[] } = {},
+): void {
+  const local = loadCollection(tx, slug);
+  const localRows = new Set([...(local?.rows.map((r) => r.id) ?? []), ...(extra.rows ?? [])]);
+  const localColumns = new Set([...(local?.columns.map((c) => c.id) ?? []), ...(extra.columns ?? [])]);
+  for (const input of inputs ?? []) {
+    if (!isRef(input)) continue;
+    const target = referenceTarget(input, { collection: slug, row: origin.row ?? '*', column: origin.column ?? '*' });
+    if (target.collection === slug) {
+      if (input.row !== undefined && !localRows.has(input.row)) throw invalid(`referenced row ${input.row} not found`);
+      if (input.column !== undefined && !localColumns.has(input.column)) throw invalid(`referenced column ${input.column} not found`);
+      if (input.row !== undefined && input.column !== undefined && input.row === origin.row && input.column === origin.column) {
+        throw invalid(`cell ${slug}/${input.row}/${input.column} cannot reference itself`);
+      }
+      if (origin.row !== undefined && input.row === origin.row && input.column === undefined) throw invalid(`row ${origin.row} cannot reference itself`);
+      if (origin.column !== undefined && input.column === origin.column && input.row === undefined) throw invalid(`column ${origin.column} cannot reference itself`);
+    } else {
+      const other = loadCollection(tx, target.collection);
+      if (!other) throw invalid(`referenced collection ${target.collection} not found`);
+      if (!other.rows.some((r) => r.id === target.row)) throw invalid(`referenced row ${target.collection}/${target.row} not found`);
+      if (!other.columns.some((c) => c.id === target.column)) throw invalid(`referenced column ${target.collection}/${target.column} not found`);
     }
   }
 }
 
+function assertColumnsExist(tx: Tx, slug: string, ids: string[] | undefined | null): void {
+  if (!ids) return;
+  const known = new Set(tx.select({ id: columns.id }).from(columns).where(eq(columns.collection, slug)).all().map((c) => c.id));
+  const missing = ids.filter((id) => !known.has(id));
+  if (missing.length > 0) throw invalid(`column(s) not found: ${missing.join(', ')}`);
+}
+
+/** After any structural write: rebuild the reference index and refuse cycles. */
+export function finishStructuralWrite(tx: Tx, slug: string): void {
+  rewriteRefs(tx, slug);
+  assertNoCycles(tx, slug);
+}
+
 /** Insert rows inside an existing transaction; ids come from the collection's counter. */
-export function addRowsTx(tx: Tx, emit: Emit, slug: string, inputs: RowInput[], opts: { keepIds?: string[] } = {}): Row[] {
+export function addRowsTx(tx: Tx, emit: Emit, slug: string, inputs: RowInput[], opts: { keepIds?: string[]; skipChecks?: boolean } = {}): Row[] {
   const coll = tx.select({ nextRow: collections.nextRow }).from(collections).where(eq(collections.slug, slug)).get();
   if (!coll) throw notFound(`collection ${slug}`);
   let next = coll.nextRow;
@@ -69,11 +89,12 @@ export function addRowsTx(tx: Tx, emit: Emit, slug: string, inputs: RowInput[], 
     }
     return `r${next++}`;
   });
-  const graph = referenceGraph(tx, slug);
-  inputs.forEach((input, i) => graph.set(ids[i]!, referencedRows(input.inputs ?? [])));
   inputs.forEach((input, i) => {
     assertAssetsExist(tx, input.inputs);
-    assertReferencesValid(graph, ids[i]!, input.inputs);
+    if (!opts.skipChecks) {
+      assertReferenceTargets(tx, slug, { row: ids[i]! }, input.inputs, { rows: ids });
+      assertColumnsExist(tx, slug, input.columns);
+    }
   });
   inputs.forEach((input, i) => {
     const id = ids[i]!;
@@ -86,6 +107,7 @@ export function addRowsTx(tx: Tx, emit: Emit, slug: string, inputs: RowInput[], 
         negativePrompt: input.negativePrompt ?? null,
         inputs: input.inputs ?? [],
         settings: input.settings ?? null,
+        columns: input.columns ?? null,
         paused: input.paused ?? false,
         position,
         notes: input.notes ?? null,
@@ -97,6 +119,7 @@ export function addRowsTx(tx: Tx, emit: Emit, slug: string, inputs: RowInput[], 
   tx.update(collections).set({ nextRow: next }).where(eq(collections.slug, slug)).run();
   renumber(tx, slug, order);
   touchCollection(tx, slug);
+  finishStructuralWrite(tx, slug);
   for (const id of created) emit({ type: 'row.updated', collection: slug, row: id });
   return created.map((id) => toRow(requireRowRow(tx, slug, id)));
 }
@@ -131,6 +154,7 @@ export function createRowService(ctx: ServiceContext) {
         negativePrompt?: string | null;
         inputs?: Row['inputs'];
         settings?: Row['settings'] | null;
+        columns?: string[] | null;
         notes?: string | null;
         position?: number;
       },
@@ -139,16 +163,21 @@ export function createRowService(ctx: ServiceContext) {
         requireCollection(tx, slug);
         requireRowRow(tx, slug, rowId);
         const set: Partial<typeof rows.$inferInsert> = {};
+        let structural = false;
         if (patch.prompt !== undefined) set.prompt = patch.prompt;
         if (patch.negativePrompt !== undefined) set.negativePrompt = patch.negativePrompt;
         if (patch.inputs !== undefined) {
           assertAssetsExist(tx, patch.inputs);
-          const graph = referenceGraph(tx, slug);
-          graph.set(rowId, referencedRows(patch.inputs));
-          assertReferencesValid(graph, rowId, patch.inputs);
+          assertReferenceTargets(tx, slug, { row: rowId }, patch.inputs);
           set.inputs = patch.inputs;
+          structural = true;
         }
         if (patch.settings !== undefined) set.settings = patch.settings;
+        if (patch.columns !== undefined) {
+          assertColumnsExist(tx, slug, patch.columns);
+          set.columns = patch.columns;
+          structural = true;
+        }
         if (patch.notes !== undefined) set.notes = patch.notes;
         if (Object.keys(set).length > 0) tx.update(rows).set(set).where(and(eq(rows.collection, slug), eq(rows.id, rowId))).run();
         if (patch.position !== undefined) {
@@ -157,6 +186,7 @@ export function createRowService(ctx: ServiceContext) {
           renumber(tx, slug, order);
         }
         touchCollection(tx, slug);
+        if (structural) finishStructuralWrite(tx, slug);
         emit({ type: 'row.updated', collection: slug, row: rowId });
         return toRow(requireRowRow(tx, slug, rowId));
       });
@@ -167,12 +197,7 @@ export function createRowService(ctx: ServiceContext) {
       const active = transact(ctx, (tx, emit) => {
         requireCollection(tx, slug);
         for (const id of ids) requireRowRow(tx, slug, id);
-        const removing = new Set(ids);
-        for (const [id, refs] of referenceGraph(tx, slug)) {
-          if (removing.has(id)) continue;
-          const hit = refs.find((r) => removing.has(r));
-          if (hit) throw conflict(`row ${hit} is referenced by row ${id}; change or remove that row first`);
-        }
+        for (const id of ids) assertUnreferenced(tx, { collection: slug, row: id }, { rows: ids }, `row ${id}`);
         const activeIds = tx
           .select({ id: generations.id, status: generations.status })
           .from(generations)
@@ -183,6 +208,7 @@ export function createRowService(ctx: ServiceContext) {
         tx.delete(rows).where(and(eq(rows.collection, slug), inArray(rows.id, ids))).run();
         renumber(tx, slug, orderedIds(tx, slug));
         touchCollection(tx, slug);
+        rewriteRefs(tx, slug);
         for (const id of ids) emit({ type: 'row.deleted', collection: slug, row: id });
         return activeIds;
       });
@@ -224,6 +250,7 @@ export function createRowService(ctx: ServiceContext) {
             ...(src.negativePrompt !== undefined ? { negativePrompt: src.negativePrompt } : {}),
             inputs: src.inputs,
             ...(src.settings ? { settings: src.settings } : {}),
+            ...(src.columns ? { columns: src.columns } : {}),
             paused: src.paused,
             ...(src.notes !== undefined ? { notes: src.notes } : {}),
             position: src.position + 1,

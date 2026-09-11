@@ -44,7 +44,7 @@ const def = (id: string) => FAL_MODELS.find((d) => `fal/${d.endpoint}` === id)!;
 function resolve(row: Partial<Row>, column: Partial<Column> = {}, defaults = {}) {
   const r: Row = { id: 'r1', prompt: 'a cat', inputs: [], paused: false, position: 0, ...row };
   const c: Column = { id: 'c1', model: SCHNELL, count: 1, position: 0, ...column };
-  return resolveCell({ defaults }, r, c, { registry, asset: (id) => assets[id] });
+  return resolveCell({ slug: 't', defaults, rows: [r], columns: [c] }, r, c, { registry, asset: (id) => assets[id] });
 }
 
 type Call = { url: string; init: RequestInit };

@@ -86,6 +86,42 @@ const MIGRATIONS: string[] = [
   )`,
   `CREATE INDEX IF NOT EXISTS assets_sha256_idx ON assets(sha256)`,
   `CREATE INDEX IF NOT EXISTS assets_created_idx ON assets(created_at)`,
+  `CREATE TABLE IF NOT EXISTS cell_pins (
+    collection TEXT NOT NULL,
+    row TEXT NOT NULL,
+    column TEXT NOT NULL,
+    generation TEXT NOT NULL REFERENCES generations(id) ON DELETE CASCADE,
+    PRIMARY KEY (collection, row, column),
+    FOREIGN KEY (collection, row) REFERENCES rows(collection, id) ON DELETE CASCADE ON UPDATE CASCADE,
+    FOREIGN KEY (collection, column) REFERENCES columns(collection, id) ON DELETE CASCADE ON UPDATE CASCADE
+  )`,
+  `CREATE TABLE IF NOT EXISTS cell_holds (
+    collection TEXT NOT NULL,
+    row TEXT NOT NULL,
+    column TEXT NOT NULL,
+    request_hash TEXT NOT NULL,
+    PRIMARY KEY (collection, row, column),
+    FOREIGN KEY (collection, row) REFERENCES rows(collection, id) ON DELETE CASCADE ON UPDATE CASCADE,
+    FOREIGN KEY (collection, column) REFERENCES columns(collection, id) ON DELETE CASCADE ON UPDATE CASCADE
+  )`,
+  `CREATE TABLE IF NOT EXISTS refs (
+    from_collection TEXT NOT NULL REFERENCES collections(slug) ON DELETE CASCADE ON UPDATE CASCADE,
+    from_kind TEXT NOT NULL,
+    from_id TEXT NOT NULL,
+    to_collection TEXT NOT NULL,
+    to_row TEXT,
+    to_column TEXT
+  )`,
+  `CREATE INDEX IF NOT EXISTS refs_from_idx ON refs(from_collection, from_kind, from_id)`,
+  `CREATE INDEX IF NOT EXISTS refs_to_idx ON refs(to_collection, to_row, to_column)`,
+];
+
+/** Columns added after the first release; applied when missing. */
+const ADDED_COLUMNS: Array<{ table: string; column: string; ddl: string }> = [
+  { table: 'columns', column: 'prompt', ddl: 'prompt TEXT' },
+  { table: 'columns', column: 'negative_prompt', ddl: 'negative_prompt TEXT' },
+  { table: 'columns', column: 'inputs', ddl: 'inputs TEXT' },
+  { table: 'rows', column: 'columns', ddl: 'columns TEXT' },
 ];
 
 export interface OpenDb {
@@ -102,6 +138,10 @@ export function openDb(file: string): OpenDb {
   sqlite.pragma('busy_timeout = 5000');
   sqlite.pragma('synchronous = NORMAL');
   for (const sql of MIGRATIONS) sqlite.exec(sql);
+  for (const add of ADDED_COLUMNS) {
+    const existing = (sqlite.pragma(`table_info(${add.table})`) as Array<{ name: string }>).map((c) => c.name);
+    if (!existing.includes(add.column)) sqlite.exec(`ALTER TABLE ${add.table} ADD COLUMN ${add.ddl}`);
+  }
   const db = drizzle(sqlite, { schema });
   return { db, sqlite, close: () => sqlite.close() };
 }

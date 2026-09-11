@@ -2,139 +2,181 @@ import { and, asc, desc, eq } from 'drizzle-orm';
 import {
   assetThumbUrl,
   assetUrl,
-  createGridResolver,
   formatCellAddress,
   isActiveStatus,
-  type Asset,
+  type CellAddress,
+  type CellAttempt,
   type CellView,
   type Collection,
   type CollectionSummary,
   type CollectionView,
   type Column,
+  type Progress,
   type ResolveResult,
   type Row,
 } from '@imaginator/core';
 import { collections, generations, type GenerationRow } from '../db/schema.js';
-import { assetLookupFor, requireCollection, type DbLike, type ServiceContext } from './context.js';
+import { requireCollection, type DbLike, type ServiceContext } from './context.js';
+import { upstreamClosure } from './refs.js';
+import { Workbook, cellKey, type Selection } from './resolver.js';
 
-const CELL_COLUMNS = {
-  id: generations.id,
-  row: generations.row,
-  column: generations.column,
-  version: generations.version,
-  requestHash: generations.requestHash,
-  status: generations.status,
-  outputs: generations.outputs,
-  error: generations.error,
-  request: generations.request,
-  queuedAt: generations.queuedAt,
-  startedAt: generations.startedAt,
-  finishedAt: generations.finishedAt,
-  cost: generations.cost,
-} as const;
+export { cellKey };
 
-export type CellGen = Pick<GenerationRow, keyof typeof CELL_COLUMNS>;
-
-export function cellKey(row: string, column: string): string {
-  return `${row} ${column}`;
-}
-
-/** Newest non-cancelled generation of a cell with exactly this hash; the cell's current version. */
-export function currentOf<G extends { status: string; requestHash: string; version: number }>(gens: G[] | undefined, hash: string): G | undefined {
-  let best: G | undefined;
-  for (const g of gens ?? []) {
-    if (g.status === 'cancelled' || g.requestHash !== hash) continue;
-    if (!best || g.version > best.version) best = g;
-  }
-  return best;
-}
-
-export type GridResolver = (row: string, column: string) => ResolveResult;
-
-/**
- * Resolver for every cell of a collection. Row references read the upstream
- * cell's current generation from `gens` (any order, any status).
- */
-export function gridResolverFor(
-  ctx: ServiceContext,
-  collection: Collection,
-  gens: Map<string, Pick<GenerationRow, 'status' | 'requestHash' | 'version' | 'outputs'>[]>,
-  assetOf: (id: string) => Asset | undefined,
-): GridResolver {
-  return createGridResolver(collection, {
-    registry: ctx.registry,
-    asset: assetOf,
-    generation: (row, column, hash) => {
-      const g = currentOf(gens.get(cellKey(row, column)), hash);
-      return g ? { status: g.status, outputs: g.outputs } : undefined;
+function attempt(g: GenerationRow): CellAttempt {
+  return {
+    generation: g.id,
+    version: g.version,
+    status: g.status,
+    ...(g.error ? { error: g.error } : {}),
+    timing: {
+      queuedAt: g.queuedAt,
+      ...(g.startedAt ? { startedAt: g.startedAt } : {}),
+      ...(g.finishedAt ? { finishedAt: g.finishedAt } : {}),
     },
-  });
+    ...(g.cost !== null && g.cost !== undefined ? { cost: g.cost } : {}),
+  };
 }
 
-/** Newest-first generations grouped by cell. */
-export function loadCellGenerations(db: DbLike, slug: string): Map<string, CellGen[]> {
-  const list = db.select(CELL_COLUMNS).from(generations).where(eq(generations.collection, slug)).orderBy(desc(generations.version)).all();
-  const map = new Map<string, CellGen[]>();
-  for (const g of list) {
-    const k = cellKey(g.row, g.column);
-    let arr = map.get(k);
-    if (!arr) map.set(k, (arr = []));
-    arr.push(g);
-  }
-  return map;
+export interface CellState {
+  view: CellView;
+  resolved: ResolveResult;
+  selection: Selection;
+  live: boolean;
 }
 
-export function buildCellView(collection: Collection, row: Row, column: Column, gens: CellGen[], resolve: GridResolver): CellView {
-  const resolved = resolve(row.id, column.id);
-  const live = gens.filter((g) => g.status !== 'cancelled');
-  const current = resolved.blocked ? undefined : currentOf(live, resolved.hash);
+/** One cell's view plus the resolution it was built from. */
+export function buildCellState(wb: Workbook, collection: Collection, row: Row, column: Column): CellState {
+  const target: CellAddress = { collection: collection.slug, row: row.id, column: column.id };
+  const { resolved, selection } = wb.state(target)!;
+  const history = wb.cellGenerations(target);
+  const live = history.filter((g) => g.status !== 'cancelled');
+  const current = resolved.skipped ? undefined : selection.current;
+  const latest = resolved.skipped ? undefined : selection.latest;
+  const fallback = !current && !resolved.skipped ? wb.newestSuccess(target) : undefined;
+  const shown = current ?? fallback;
+  const status = resolved.skipped ? 'skipped' : latest ? latest.status : resolved.blocked ? 'blocked' : 'missing';
   const view: CellView = {
     row: row.id,
     column: column.id,
-    address: formatCellAddress({ collection: collection.slug, row: row.id, column: column.id }),
+    address: formatCellAddress(target),
     hash: resolved.hash,
-    status: current ? current.status : resolved.blocked ? 'blocked' : 'missing',
-    ...(resolved.blocked ? { blocked: resolved.blocked } : {}),
+    status,
+    ...(resolved.blocked && !resolved.skipped ? { blocked: resolved.blocked } : {}),
+    ...(current ? { generation: current.id, version: current.version } : {}),
+    ...(latest ? { latest: attempt(latest) } : {}),
     versions: live.length,
-    outputs: current?.outputs ?? [],
-    urls: (current?.outputs ?? []).map(assetUrl),
-    thumbnails: (current?.outputs ?? []).map(assetThumbUrl),
+    outputs: shown?.outputs ?? [],
+    urls: (shown?.outputs ?? []).map(assetUrl),
+    thumbnails: (shown?.outputs ?? []).map(assetThumbUrl),
+    ...(fallback ? { stale: true } : {}),
+    ...(selection.held && !resolved.skipped ? { hold: true } : {}),
   };
-  if (current) {
-    view.generation = current.id;
-    view.version = current.version;
-    if (current.error) view.error = current.error;
-    if (current.cost !== null && current.cost !== undefined) view.cost = current.cost;
+  if (selection.pin) {
+    const pinned = history.find((g) => g.id === selection.pin!.generation);
+    if (pinned) view.pin = { generation: pinned.id, version: pinned.version, active: selection.pinActive };
+  }
+  const timingSource = latest ?? current;
+  if (timingSource) {
+    if (latest?.error) view.error = latest.error;
+    const costSource = current ?? latest;
+    if (costSource && costSource.cost !== null && costSource.cost !== undefined) view.cost = costSource.cost;
     view.timing = {
-      queuedAt: current.queuedAt,
-      ...(current.startedAt ? { startedAt: current.startedAt } : {}),
-      ...(current.finishedAt ? { finishedAt: current.finishedAt } : {}),
+      queuedAt: timingSource.queuedAt,
+      ...(timingSource.startedAt ? { startedAt: timingSource.startedAt } : {}),
+      ...(timingSource.finishedAt ? { finishedAt: timingSource.finishedAt } : {}),
     };
   }
   // What the model ignores *now*, so the UI can say "seed ignored" even for an older snapshot.
   if (resolved.request.droppedKeys.length > 0) view.droppedKeys = resolved.request.droppedKeys;
-  return view;
+  return { view, resolved, selection, live: collection.status === 'live' && !row.paused };
+}
+
+export function buildCellView(wb: Workbook, collection: Collection, row: Row, column: Column): CellView {
+  return buildCellState(wb, collection, row, column).view;
+}
+
+/** Dependency-aware progress (DESIGN §5, "Collection progress and waiting"). */
+export function buildProgress(ctx: ServiceContext, wb: Workbook, db: DbLike, collection: Collection, cells: CellState[]): Progress {
+  const slug = collection.slug;
+  const upstream = upstreamClosure(db, [slug]).filter((s) => s !== slug);
+  let pendingReconcile = ctx.hooks.reconcilePending?.(slug) ?? false;
+  let upQueued = 0;
+  let upInFlight = 0;
+  for (const s of upstream) {
+    if (ctx.hooks.reconcilePending?.(s)) pendingReconcile = true;
+    for (const list of wb.generations(s).values()) {
+      for (const g of list) {
+        if (g.status === 'queued') upQueued++;
+        else if (isActiveStatus(g.status)) upInFlight++;
+      }
+    }
+  }
+
+  const blocked: Progress['blocked'] = [];
+  const attention: Progress['attention'] = { failed: [], unsupported: [], needsAttention: [] };
+  const failedAttempts: Progress['failedAttempts'] = [];
+  let running = pendingReconcile || upQueued > 0 || upInFlight > 0;
+  let allHaveCurrent = true;
+
+  for (const c of cells) {
+    const { view, resolved, selection, live } = c;
+    if (resolved.skipped) continue;
+    if (!selection.current) allHaveCurrent = false;
+    if (resolved.blocked) {
+      blocked.push({ cell: view.address, reason: resolved.blocked, pending: resolved.pending ?? false });
+      if (resolved.pending) running = true;
+      continue;
+    }
+    const latest = selection.latest;
+    if (!latest) {
+      // Nothing attempted yet: work is coming if the scope is live and not held.
+      if (live && !selection.held) running = true;
+      continue;
+    }
+    if (isActiveStatus(latest.status)) {
+      running = true;
+      continue;
+    }
+    const issue = { cell: view.address, message: latest.error?.message ?? latest.status };
+    if (latest.status === 'succeeded') continue;
+    if (selection.current) {
+      failedAttempts.push(issue);
+    } else if (latest.status === 'failed') attention.failed.push(issue);
+    else if (latest.status === 'unsupported') attention.unsupported.push(issue);
+    else if (latest.status === 'needs_attention') attention.needsAttention.push(issue);
+  }
+
+  const state: Progress['state'] = running ? 'running' : blocked.length > 0 ? 'blocked' : 'settled';
+  return {
+    state,
+    allSucceeded: state === 'settled' && allHaveCurrent && attention.failed.length === 0 && attention.unsupported.length === 0 && attention.needsAttention.length === 0,
+    pendingReconcile,
+    upstream: { queued: upQueued, inFlight: upInFlight },
+    blocked,
+    attention,
+    failedAttempts,
+  };
 }
 
 export function buildCollectionView(ctx: ServiceContext, db: DbLike, slug: string): CollectionView {
   const collection = requireCollection(db, slug);
-  const gens = loadCellGenerations(db, slug);
-  const resolve = gridResolverFor(ctx, collection, gens, assetLookupFor(db, collection));
-  const cells: CellView[] = [];
+  const wb = new Workbook(ctx, db);
+  const states: CellState[] = [];
   for (const row of collection.rows) {
     for (const column of collection.columns) {
-      cells.push(buildCellView(collection, row, column, gens.get(cellKey(row.id, column.id)) ?? [], resolve));
+      states.push(buildCellState(wb, collection, row, column));
     }
   }
   let inFlight = 0;
   let queued = 0;
-  for (const list of gens.values()) {
+  for (const list of wb.generations(slug).values()) {
     for (const g of list) {
       if (g.status === 'queued') queued++;
       else if (isActiveStatus(g.status)) inFlight++;
     }
   }
-  return { ...collection, cells, cursor: ctx.bus.cursor(slug), inFlight, queued };
+  const progress = buildProgress(ctx, wb, db, collection, states);
+  return { ...collection, cells: states.map((s) => s.view), cursor: ctx.bus.cursor(slug), inFlight, queued, progress };
 }
 
 export function buildSummaries(ctx: ServiceContext, db: DbLike): CollectionSummary[] {
@@ -159,6 +201,7 @@ export function buildSummaries(ctx: ServiceContext, db: DbLike): CollectionSumma
       inFlight: view.inFlight,
       queued: view.queued,
       failed,
+      progress: view.progress.state,
       cursor: view.cursor,
       createdAt: view.createdAt,
       updatedAt: view.updatedAt,

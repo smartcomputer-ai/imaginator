@@ -71,7 +71,7 @@ describe('runner', () => {
     await run(app, 'collections.create', { slug: 'c', columns: [{ model: 'mock/fast' }], rows: [{ prompt: 'running' }, { prompt: 'waiting' }] });
     await mockControl.waitForHeld(1, 'running');
     expect(cell(app.services.collections.get('c'), 'r2', 'fast').status).toBe('queued');
-    const queuedId = cell(app.services.collections.get('c'), 'r2', 'fast').generation!;
+    const queuedId = cell(app.services.collections.get('c'), 'r2', 'fast').latest!.generation;
 
     await run(app, 'rows.update', { collection: 'c', row: 'r2', prompt: 'waiting v2' });
     await app.reconciler.settled('c');
@@ -148,7 +148,7 @@ describe('runner', () => {
     await sleep(100);
     expect(generateCalls().filter((c) => c.model === 'mock/flaky')).toHaveLength(1);
 
-    await expect(run(app, 'cells.retry', { cell: 'c/r1/fast' })).rejects.toThrow(/only failed/);
+    await expect(run(app, 'cells.retry', { cell: 'c/r1/fast' })).rejects.toThrow(/succeeded; use regenerate/);
     const retried = await run(app, 'cells.retry', { cell: 'c/r1/flaky' });
     expect(retried.generation.status).toBe('queued');
     expect(retried.generation.version).toBe(2);
@@ -213,19 +213,28 @@ describe('runner', () => {
     const none = await run(app, 'cells.cancel', { cell: 'c/r1/slow' });
     expect(none.generation).toBeUndefined();
 
-    // With a pending outcome the generation stays running.
-    mockControl.cancelOutcome = 'pending';
+    // An explicit cancel holds the cell: a pass (or an unrelated edit) does not recreate the work.
     await run(app, 'rows.update', { collection: 'c', row: 'r2', notes: 'poke' });
-    await mockControl.waitForHeld(1);
-    const pendingCancel = await run(app, 'cells.cancel', { cell: `c/${mockControl.heldCalls()[0]!.prompt === 'held' ? 'r1' : 'r2'}/slow` });
+    const held = await settle(app, 'c');
+    expect(cell(held, 'r1', 'slow')).toMatchObject({ status: 'missing', hold: true });
+    expect(cell(held, 'r2', 'slow')).toMatchObject({ status: 'missing', hold: true });
+    expect(genRows(app, 'c')).toHaveLength(2);
+
+    // Retry releases the hold. With a pending cancel outcome the generation stays running.
+    mockControl.cancelOutcome = 'pending';
+    await run(app, 'cells.retry', { cell: 'c/r2/slow' });
+    await mockControl.waitForHeld(1, 'queued');
+    const pendingCancel = await run(app, 'cells.cancel', { cell: 'c/r2/slow' });
     expect(pendingCancel.generation?.status).toBe('running');
 
-    // Cancelled generations do not satisfy the cell: the reconciler filled both cells again.
     unhold();
     mockControl.release();
     const view = await settle(app, 'c');
-    expect(cell(view, 'r1', 'slow').status).toBe('succeeded');
     expect(cell(view, 'r2', 'slow').status).toBe('succeeded');
+    expect(cell(view, 'r1', 'slow')).toMatchObject({ status: 'missing', hold: true });
+    await run(app, 'cells.retry', { cell: 'c/r1/slow' });
+    const done = await settle(app, 'c');
+    expect(cell(done, 'r1', 'slow').status).toBe('succeeded');
     expect(genRows(app, 'c').map((g) => g.status).sort()).toEqual(['cancelled', 'cancelled', 'succeeded', 'succeeded']);
   });
 

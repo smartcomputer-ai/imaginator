@@ -5,6 +5,7 @@ import {
   columnIdSchema,
   generationIdSchema,
   modelIdSchema,
+  parseReference,
   rowIdSchema,
 } from './ids.js';
 import { jsonObjectSchema, jsonValueSchema } from './json.js';
@@ -35,32 +36,56 @@ function checkMask(v: { role: InputRole; maskFor?: number }, ctx: z.RefinementCt
   }
 }
 
-/** A fixed image: an uploaded or previously generated asset. */
+/** A frozen image: an uploaded or previously generated asset. */
 export const assetInputSchema = z.object({ asset: assetIdSchema, ...inputBase }).superRefine(checkMask);
 export type AssetInput = z.infer<typeof assetInputSchema>;
 
 /**
- * A live reference to another row's cell *in the same column*: the current
- * output of `row` in this column is the input. Follow-up edits chain this way
- * (DESIGN §3, "Row references"). `output` indexes the upstream cell's outputs.
+ * A live reference to another cell's current output (DESIGN §3, References).
+ * Anchors left out are filled from the cell being resolved: on a row, `row`
+ * is required and `column` defaults to the same column; on a column,
+ * `column` is required and `row` defaults to the same row. `collection`
+ * requires both. `output` indexes the source cell's outputs (default 0).
  */
-export const rowRefInputSchema = z
+export const refInputSchema = z
   .object({
-    row: rowIdSchema,
+    row: rowIdSchema.optional(),
+    column: columnIdSchema.optional(),
+    collection: collectionSlugSchema.optional(),
     output: z.number().int().min(0).optional(),
     ...inputBase,
   })
-  .superRefine(checkMask);
-export type RowRefInput = z.infer<typeof rowRefInputSchema>;
+  .superRefine((v, ctx) => {
+    checkMask(v, ctx);
+    if (v.row === undefined && v.column === undefined) ctx.addIssue({ code: 'custom', message: 'a reference needs a row, a column, or both' });
+    if (v.collection !== undefined && (v.row === undefined || v.column === undefined)) {
+      ctx.addIssue({ code: 'custom', message: 'a reference into another collection must be a full address (collection, row, column)' });
+    }
+  });
+export type RefInput = z.infer<typeof refInputSchema>;
 
-export const inputSchema = z.union([assetInputSchema, rowRefInputSchema]);
-export type Input = z.infer<typeof inputSchema>;
+/** `{ ref: 'r3/flux', role }`: the string form of a reference, normalized to `RefInput`. */
+const refStringInputSchema = z
+  .object({ ref: z.string(), output: z.number().int().min(0).optional(), ...inputBase })
+  .transform(({ ref, ...rest }, ctx) => {
+    try {
+      const anchors = parseReference(ref);
+      return { ...anchors, ...rest } as RefInput;
+    } catch (e) {
+      ctx.addIssue({ code: 'custom', message: (e as Error).message });
+      return z.NEVER;
+    }
+  })
+  .pipe(refInputSchema);
 
-export function isRowRef(input: Input): input is RowRefInput {
-  return 'row' in input;
+export const inputSchema = z.union([assetInputSchema, refInputSchema, refStringInputSchema]);
+export type Input = AssetInput | RefInput;
+
+export function isRef(input: Input): input is RefInput {
+  return !('asset' in input);
 }
 
-export const inputsSchema = z.array(inputSchema).superRefine((inputs, ctx) => {
+function checkMaskTargets(inputs: Input[], ctx: z.RefinementCtx): void {
   inputs.forEach((input, i) => {
     if (input.role !== 'mask') return;
     const target = inputs[input.maskFor!];
@@ -70,7 +95,26 @@ export const inputsSchema = z.array(inputSchema).superRefine((inputs, ctx) => {
       ctx.addIssue({ code: 'custom', path: [i, 'maskFor'], message: `maskFor ${input.maskFor} must point at an init input` });
     }
   });
+}
+
+/** Inputs written on a row: every reference names a row. */
+export const rowInputsSchema = z.array(inputSchema).superRefine((inputs, ctx) => {
+  checkMaskTargets(inputs, ctx);
+  inputs.forEach((input, i) => {
+    if (isRef(input) && input.row === undefined) ctx.addIssue({ code: 'custom', path: [i], message: 'a reference on a row must name a row (r3 or r3/column)' });
+  });
 });
+
+/** Inputs written on a column recipe: every reference names a column. */
+export const columnInputsSchema = z.array(inputSchema).superRefine((inputs, ctx) => {
+  checkMaskTargets(inputs, ctx);
+  inputs.forEach((input, i) => {
+    if (isRef(input) && input.column === undefined) ctx.addIssue({ code: 'custom', path: [i], message: 'a reference on a column must name a column (flux or r3/flux)' });
+  });
+});
+
+/** @deprecated use rowInputsSchema */
+export const inputsSchema = rowInputsSchema;
 
 // ---------------------------------------------------------------------------
 // Columns, rows, collections
@@ -83,6 +127,12 @@ export const columnSchema = z.object({
   /** Outputs per cell; capped by the model's `capabilities.count`. */
   count: z.number().int().min(1),
   position: z.number().int().min(0),
+  /** Recipe: prompt template, default `{prompt}`. */
+  prompt: z.string().optional(),
+  /** Recipe: negative prompt template, default `{negativePrompt}`; '' drops it. */
+  negativePrompt: z.string().optional(),
+  /** Recipe: absent inherits the row's inputs; present replaces them. */
+  inputs: columnInputsSchema.optional(),
 });
 export type Column = z.infer<typeof columnSchema>;
 
@@ -90,8 +140,10 @@ export const rowSchema = z.object({
   id: rowIdSchema,
   prompt: z.string(),
   negativePrompt: z.string().optional(),
-  inputs: inputsSchema,
+  inputs: rowInputsSchema,
   settings: commonSettingsSchema.optional(),
+  /** Sparse row: run only in these columns; absent = every column. */
+  columns: z.array(columnIdSchema).optional(),
   paused: z.boolean(),
   position: z.number().int().min(0),
   notes: z.string().optional(),

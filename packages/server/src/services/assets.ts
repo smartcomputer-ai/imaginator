@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import path from 'node:path';
 import { and, desc, eq, like, sql } from 'drizzle-orm';
-import { isRowRef, type AssetView } from '@imaginator/core';
+import { isRef, type AssetView } from '@imaginator/core';
 import { nowIso } from '../db/index.js';
 import { assets, generations, rows, type AssetRow } from '../db/schema.js';
 import { invalid, notFound } from '../errors.js';
@@ -134,7 +134,7 @@ export function createAssetService(ctx: ServiceContext) {
     /** Set of asset ids referenced by any row input or generation output. */
     referencedIds(): Set<string> {
       const refs = new Set<string>();
-      for (const r of ctx.db.select({ inputs: rows.inputs }).from(rows).all()) for (const i of r.inputs) if (!isRowRef(i)) refs.add(i.asset);
+      for (const r of ctx.db.select({ inputs: rows.inputs }).from(rows).all()) for (const i of r.inputs) if (!isRef(i)) refs.add(i.asset);
       for (const g of ctx.db.select({ outputs: generations.outputs }).from(generations).all()) for (const id of g.outputs) refs.add(id);
       return refs;
     },

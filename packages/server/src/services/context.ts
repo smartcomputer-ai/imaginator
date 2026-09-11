@@ -2,7 +2,7 @@ import { and, asc, eq, inArray, sql } from 'drizzle-orm';
 import {
   assetThumbUrl,
   assetUrl,
-  isRowRef,
+  isRef,
   randomId,
   type Asset,
   type AssetView,
@@ -28,6 +28,8 @@ export interface EngineHooks {
   reconcileSettled?: (collection: string) => Promise<void>;
   /** Run a reconcile pass right away (resume/unpause). */
   reconcileNow?: (collection: string) => Promise<void>;
+  /** A pass is pending or running for the collection. */
+  reconcilePending?: (collection: string) => boolean;
 }
 
 export interface ServiceContext {
@@ -56,7 +58,16 @@ export function transact<T>(ctx: ServiceContext, fn: (tx: Tx, emit: Emit) => T):
 // ---------------------------------------------------------------------------
 
 export function toColumn(r: ColumnRow): Column {
-  return { id: r.id, model: r.model, ...(r.settings ? { settings: r.settings } : {}), count: r.count, position: r.position };
+  return {
+    id: r.id,
+    model: r.model,
+    ...(r.settings ? { settings: r.settings } : {}),
+    count: r.count,
+    position: r.position,
+    ...(r.prompt !== null && r.prompt !== undefined ? { prompt: r.prompt } : {}),
+    ...(r.negativePrompt !== null && r.negativePrompt !== undefined ? { negativePrompt: r.negativePrompt } : {}),
+    ...(r.inputs ? { inputs: r.inputs } : {}),
+  };
 }
 
 export function toRow(r: RowRow): Row {
@@ -66,6 +77,7 @@ export function toRow(r: RowRow): Row {
     ...(r.negativePrompt !== null ? { negativePrompt: r.negativePrompt } : {}),
     inputs: r.inputs,
     ...(r.settings ? { settings: r.settings } : {}),
+    ...(r.columns ? { columns: r.columns } : {}),
     paused: r.paused,
     position: r.position,
     ...(r.notes !== null ? { notes: r.notes } : {}),
@@ -171,7 +183,7 @@ export function loadAssetsById(db: DbLike, ids: Iterable<string>): Map<string, A
  * fetched on first use and cached.
  */
 export function assetLookupFor(db: DbLike, collection: Collection): (id: string) => Asset | undefined {
-  const ids = collection.rows.flatMap((r) => r.inputs.flatMap((i) => (isRowRef(i) ? [] : [i.asset])));
+  const ids = [...collection.rows.flatMap((r) => r.inputs), ...collection.columns.flatMap((c) => c.inputs ?? [])].flatMap((i) => (isRef(i) ? [] : [i.asset]));
   const map = new Map<string, Asset | undefined>();
   for (const [id, a] of loadAssetsById(db, ids)) map.set(id, toAsset(a));
   for (const id of ids) if (!map.has(id)) map.set(id, undefined);

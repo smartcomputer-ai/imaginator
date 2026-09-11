@@ -14,6 +14,7 @@ import { nowIso } from '../db/index.js';
 import { assets, generations, type GenerationRow } from '../db/schema.js';
 import { notFound } from '../errors.js';
 import { toGeneration, transact, type Emit, type ServiceContext } from './context.js';
+import { Workbook } from './resolver.js';
 import { loadCellHistory } from './view.js';
 
 const ACTIVE = [...ACTIVE_STATUSES];
@@ -67,14 +68,33 @@ export function createGenerationService(ctx: ServiceContext) {
 
     /**
      * Pick queued generations (oldest first) accepted by `pick` and mark them
-     * `submitting` in the same transaction. Returns the claimed rows.
+     * `submitting` in the same transaction. Before claiming, each one is
+     * revalidated against current state (DESIGN §4.2): its request must still
+     * be desired, its scope live, and no hold may apply. Obsolete queued work
+     * is cancelled instead of submitted. Returns the claimed rows.
      */
     claimQueued(pick: (g: GenerationRow) => boolean, limit = 200): GenerationRow[] {
       return transact(ctx, (tx, emit) => {
         const queued = tx.select().from(generations).where(eq(generations.status, 'queued')).orderBy(asc(generations.seq)).limit(limit).all();
         const claimed: GenerationRow[] = [];
         const now = nowIso();
+        const wb = new Workbook(ctx, tx);
+        const stillWanted = (g: GenerationRow): boolean => {
+          const grid = wb.grid(g.collection);
+          const row = grid?.rows.find((r) => r.id === g.row);
+          if (!grid || !row || grid.status !== 'live' || row.paused) return false;
+          const state = wb.state({ collection: g.collection, row: g.row, column: g.column });
+          if (!state) return false;
+          const { resolved, selection } = state;
+          if (resolved.skipped || resolved.blocked || resolved.hash !== g.requestHash) return false;
+          return !selection.held;
+        };
         for (const g of queued) {
+          if (!stillWanted(g)) {
+            tx.update(generations).set({ status: 'cancelled', finishedAt: now }).where(eq(generations.id, g.id)).run();
+            emitFor(emit, g, 'cancelled');
+            continue;
+          }
           if (!pick(g)) continue;
           tx.update(generations).set({ status: 'submitting', startedAt: g.startedAt ?? now }).where(eq(generations.id, g.id)).run();
           emitFor(emit, g, 'submitting');

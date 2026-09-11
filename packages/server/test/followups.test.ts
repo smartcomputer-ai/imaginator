@@ -96,7 +96,7 @@ describe('row references (follow-up edits)', () => {
     const v1 = await settle(app, 'c');
     expect(cell(v1, 'r1', 'img2img').status).toBe('failed');
     expect(cell(v1, 'r2', 'img2img').status).toBe('blocked');
-    expect(cell(v1, 'r2', 'img2img').blocked).toBe('r1 failed');
+    expect(cell(v1, 'r2', 'img2img').blocked).toBe('r1/img2img cannot produce an output (failed); see that cell');
     expect(genRows(app, 'c', 'r2')).toHaveLength(0);
     await expect(run(app, 'cells.regenerate', { cell: 'c/r2/img2img' })).rejects.toThrow(/blocked/);
 
@@ -110,7 +110,7 @@ describe('row references (follow-up edits)', () => {
     const v3 = await settle(app, 'c');
     expect(cell(v3, 'r1', 'img2img').status).toBe('missing');
     expect(cell(v3, 'r2', 'img2img').status).toBe('blocked');
-    expect(cell(v3, 'r2', 'img2img').blocked).toBe('waiting for r1');
+    expect(cell(v3, 'r2', 'img2img').blocked).toBe('r1/img2img is paused and needs generation');
     await run(app, 'rows.resume', { collection: 'c', rows: ['r1'] });
     const v4 = await settle(app, 'c');
     expect(cell(v4, 'r2', 'img2img').status).toBe('succeeded');
@@ -141,8 +141,8 @@ describe('row references (follow-up edits)', () => {
     await expect(run(app, 'rows.add', { collection: 'c', rows: [{ prompt: 'x', inputs: [{ row: 'r9', role: 'init' }] }] })).rejects.toThrow(/r9 not found/);
     await expect(run(app, 'rows.update', { collection: 'c', row: 'r1', inputs: [{ row: 'r1', role: 'init' }] })).rejects.toThrow(/itself/);
     await run(app, 'rows.update', { collection: 'c', row: 'r2', inputs: [{ row: 'r1', role: 'init' }] });
-    await expect(run(app, 'rows.update', { collection: 'c', row: 'r1', inputs: [{ row: 'r2', role: 'init' }] })).rejects.toThrow(/reference each other/);
-    await expect(run(app, 'rows.remove', { collection: 'c', rows: ['r1'] })).rejects.toThrow(/referenced by row r2/);
+    await expect(run(app, 'rows.update', { collection: 'c', row: 'r1', inputs: [{ row: 'r2', role: 'init' }] })).rejects.toThrow(/reference cycle/);
+    await expect(run(app, 'rows.remove', { collection: 'c', rows: ['r1'] })).rejects.toThrow(/referenced by c\/r2/);
     // Removing both at once is fine.
     await run(app, 'rows.remove', { collection: 'c', rows: ['r1', 'r2'] });
     // A batch may reference rows within itself.

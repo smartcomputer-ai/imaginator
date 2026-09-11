@@ -256,14 +256,19 @@ rewrites the references into it. Duplicating a row or a collection, and
 export/import, keep references as written; references into other
 collections must resolve on import.
 
-The index distinguishes written references from the effective cell edges
-after recipe expansion and sparse-row filtering. Scheduling, cycle detection,
-and impact previews use the effective graph; integrity checks also retain
-written references that a recipe currently ignores. Every structural write,
-including adding columns, changing recipes, or changing `row.columns`, checks
-the resulting graph in the same transaction. Changing a reference to another
-cell with the same asset still updates the index even when the hash stays
-the same.
+The index stores references as written; the concrete cell graph is expanded
+from it on demand (every row × column, anchors filled in, targets that
+exist). Cycle detection and impact previews run on that concrete graph with
+skipped cells included, deliberately conservative: a cycle through a cell
+that is skipped today would become live the moment the row widened, so it is
+refused now. Integrity checks (delete, rename) use the written references,
+so a reference a recipe currently ignores still protects its target. Every
+structural write, including adding columns, changing recipes, or changing
+`row.columns`, rebuilds the index and checks the graph in the same
+transaction. A column that anything references cannot be renamed or removed;
+a collection that anything references cannot be deleted, and renaming it
+rewrites the references into it. Changing a reference to another cell with
+the same asset still updates the index even when the hash stays the same.
 
 ### Column recipes
 
@@ -1159,11 +1164,10 @@ present. The model registry is code; adding a model is adding a `ModelSpec`.
    checks, delete refusal, rename rewriting, explicit export dependencies,
    and cross-collection impact previews before enabling live external links.
 
-Steps 1 to 6 have an initial implementation. Step 7 changes its latest-attempt
-selection behavior and completes the execution and progress contracts above;
-these are target semantics, not claims that all are already implemented.
-Each remaining step is usable on its own. Pins and local pipelines precede
-the global dependency-management work.
+All nine steps are implemented and covered by the verification cases below
+(`packages/server/test/followups.test.ts` and `references.test.ts` for steps
+6 to 9). The `mock/edit` model (init and reference inputs, no negative
+prompt) stands in for instruction-driven editors in tests.
 
 **Verification.** The cases worth a test each, run against a temporary
 SQLite file and the controllable mock provider:

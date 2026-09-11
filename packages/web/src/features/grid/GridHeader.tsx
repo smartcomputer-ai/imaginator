@@ -6,6 +6,7 @@ import { useApi, useCommand } from '@/api/queries';
 import { CommonSettingsForm } from '@/components/CommonSettingsForm';
 import { InlineTextarea } from '@/components/InlineEdit';
 import { CellCounts } from '@/pages/CollectionsPage';
+import { ProgressBadge } from '@/components/ProgressBadge';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from '@/components/ui/dropdown-menu';
@@ -92,6 +93,7 @@ export function GridHeader({ collection, zoom }: { collection: CollectionView; z
           </TooltipContent>
         </Tooltip>
         <CellCounts succeeded={counts.succeeded} inFlight={collection.inFlight} queued={collection.queued} failed={counts.failed} total={collection.cells.length} />
+        <ProgressBadge state={collection.progress.state} progress={collection.progress} />
         {spend !== undefined && (
           <Tooltip>
             <TooltipTrigger asChild>

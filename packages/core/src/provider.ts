@@ -8,6 +8,8 @@ export interface ModelCapabilities {
   /** Empty = text-only. */
   inputRoles: InputRole[];
   maxInputImages: number;
+  /** Inputs the model cannot run without (an edit-only endpoint); default 0. */
+  minInputImages?: number;
   negativePrompt: boolean;
   commonKeys: CommonKey[];
   /** Max outputs per request. */

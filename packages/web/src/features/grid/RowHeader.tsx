@@ -1,6 +1,9 @@
 import { useState } from 'react';
-import { assetThumbUrl, INPUT_ROLES, isRowRef, type CommonSettings, type Input as RowInputRef, type InputRole, type Row } from '@imaginator/core';
-import { ChevronDown, ChevronUp, Copy, CornerDownRight, ImagePlus, MoreHorizontal, Pause, Play, Settings2, StickyNote, Trash2, X } from 'lucide-react';
+import { assetThumbUrl, INPUT_ROLES, isRef, type CommonSettings, type Input as RowInputRef, type InputRole, type Row } from '@imaginator/core';
+import { ChevronDown, ChevronUp, Columns3, Copy, CornerDownRight, ImagePlus, MoreHorizontal, Pause, Play, Settings2, StickyNote, Trash2, X } from 'lucide-react';
+import { ReferencePicker } from '@/components/ReferencePicker';
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog';
+import { refLabel } from './ColumnHeader';
 import { useApi, useCommand } from '@/api/queries';
 import { extractDropPayload, useUploadFiles } from '@/api/upload';
 import { AssetPicker } from '@/components/AssetPicker';
@@ -23,6 +26,7 @@ export function RowHeader({
   index,
   total,
   order,
+  columns,
 }: {
   slug: string;
   row: Row;
@@ -30,10 +34,11 @@ export function RowHeader({
   index: number;
   total: number;
   order: string[];
+  /** All column ids, in grid order (for the sparse-row editor). */
+  columns: string[];
 }) {
   const api = useApi();
   const update = useCommand('rows.update');
-  const addRows = useCommand('rows.add');
   const pause = useCommand('rows.pause');
   const resume = useCommand('rows.resume');
   const duplicate = useCommand('rows.duplicate');
@@ -41,9 +46,11 @@ export function RowHeader({
   const reorder = useCommand('rows.reorder');
   const { upload, uploading } = useUploadFiles();
   const [pickerOpen, setPickerOpen] = useState(false);
+  const [refOpen, setRefOpen] = useState(false);
   const [showNegative, setShowNegative] = useState(false);
   const [showNotes, setShowNotes] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [columnsOpen, setColumnsOpen] = useState(false);
   const [dragOver, setDragOver] = useState(false);
 
   const setInputs = (inputs: RowInputRef[]) => update.mutate({ collection: slug, row: row.id, inputs });
@@ -73,8 +80,6 @@ export function RowHeader({
     });
     setInputs(next);
   };
-  // A follow-up row edits this row's current output, column by column.
-  const addFollowUp = () => addRows.mutate({ collection: slug, rows: [{ prompt: '', inputs: [{ row: row.id, role: 'init' }], position: index + 1 }] });
 
   const move = (delta: number) => {
     const next = [...order];
@@ -120,6 +125,15 @@ export function RowHeader({
       <div className="flex items-center gap-1">
         <span className="font-mono text-[11px] text-muted-foreground">{row.id}</span>
         {row.paused && <Badge variant="muted">paused</Badge>}
+        {row.columns && (
+          <WithTooltip label={`Runs only in: ${row.columns.join(', ')}`}>
+            <button type="button" className="cursor-pointer" onClick={() => setColumnsOpen(true)}>
+              <Badge variant="outline">
+                <Columns3 className="size-2.5" /> {row.columns.length}/{columns.length}
+              </Badge>
+            </button>
+          </WithTooltip>
+        )}
         {hasSettings && (
           <WithTooltip label={JSON.stringify(row.settings)}>
             <Badge variant="outline">settings</Badge>
@@ -166,9 +180,7 @@ export function RowHeader({
               <DropdownMenuItem onSelect={() => duplicate.mutate({ collection: slug, row: row.id })}>
                 <Copy /> Duplicate
               </DropdownMenuItem>
-              <DropdownMenuItem onSelect={addFollowUp}>
-                <CornerDownRight /> Add follow-up row
-              </DropdownMenuItem>
+
               <DropdownMenuItem onSelect={() => setShowNegative(true)}>
                 <X /> Negative prompt
               </DropdownMenuItem>
@@ -176,7 +188,13 @@ export function RowHeader({
                 <StickyNote /> Notes
               </DropdownMenuItem>
               <DropdownMenuItem onSelect={() => setPickerOpen(true)}>
-                <ImagePlus /> Add input…
+                <ImagePlus /> Add input image…
+              </DropdownMenuItem>
+              <DropdownMenuItem onSelect={() => setRefOpen(true)}>
+                <CornerDownRight /> Add reference to a cell…
+              </DropdownMenuItem>
+              <DropdownMenuItem onSelect={() => setColumnsOpen(true)}>
+                <Columns3 /> Run in columns…
               </DropdownMenuItem>
               <DropdownMenuSeparator />
               <DropdownMenuItem disabled={index === 0} onSelect={() => move(-1)}>
@@ -248,14 +266,14 @@ export function RowHeader({
       <div className="mt-auto flex flex-wrap items-center gap-1 pt-0.5">
         {row.inputs.map((inp, i) => (
           <div
-            key={`${isRowRef(inp) ? inp.row : inp.asset}-${i}`}
-            className="group/input relative size-10 overflow-hidden rounded border bg-muted"
-            title={`${isRowRef(inp) ? `output of ${inp.row} in the same column` : inp.asset} · ${inp.role}${inp.maskFor !== undefined ? ` for #${inp.maskFor}` : ''}`}
+            key={`${isRef(inp) ? refLabel(inp) : inp.asset}-${i}`}
+            className={cn('group/input relative size-10 overflow-hidden rounded border bg-muted', isRef(inp) && 'min-w-10 w-auto max-w-24 px-1')}
+            title={`${isRef(inp) ? `live: current output of ${refLabel(inp)}${inp.column ? '' : ' in the same column'}` : inp.asset} · ${inp.role}${inp.maskFor !== undefined ? ` for #${inp.maskFor}` : ''}`}
           >
-            {isRowRef(inp) ? (
+            {isRef(inp) ? (
               <div className="flex size-full flex-col items-center justify-center pb-3 text-muted-foreground">
                 <CornerDownRight className="size-3" />
-                <span className="font-mono text-[10px] leading-none">{inp.row}</span>
+                <span className="max-w-full truncate font-mono text-[10px] leading-none">{refLabel(inp)}</span>
               </div>
             ) : (
               <img src={assetThumbUrl(inp.asset)} alt={inp.asset} className="size-full object-cover" loading="lazy" draggable={false} />
@@ -292,6 +310,11 @@ export function RowHeader({
             {uploading ? <Spinner /> : <ImagePlus />}
           </Button>
         </WithTooltip>
+        <WithTooltip label="Add a live reference to another cell's output (follow-up chain or a shared base)">
+          <Button variant="outline" size="iconSm" className="size-10 text-muted-foreground" onClick={() => setRefOpen(true)}>
+            <CornerDownRight />
+          </Button>
+        </WithTooltip>
       </div>
 
       <AssetPicker
@@ -302,6 +325,83 @@ export function RowHeader({
           await api('rows.update', { collection: slug, row: row.id, inputs: [...row.inputs, add] });
         }}
       />
+      <ReferencePicker
+        open={refOpen}
+        onOpenChange={setRefOpen}
+        slug={slug}
+        rowId={row.id}
+        onPick={async (input) => {
+          await api('rows.update', { collection: slug, row: row.id, inputs: [...row.inputs, input] });
+        }}
+      />
+      <SparseColumnsDialog
+        open={columnsOpen}
+        onOpenChange={setColumnsOpen}
+        columns={columns}
+        value={row.columns}
+        saving={update.isPending}
+        onSave={(cols) => update.mutate({ collection: slug, row: row.id, columns: cols }, { onSuccess: () => setColumnsOpen(false) })}
+      />
     </div>
+  );
+}
+
+/** Sparse row: choose the columns this row runs in. Cells outside are skipped, at no cost. */
+function SparseColumnsDialog({
+  open,
+  onOpenChange,
+  columns,
+  value,
+  saving,
+  onSave,
+}: {
+  open: boolean;
+  onOpenChange: (o: boolean) => void;
+  columns: string[];
+  value: string[] | undefined;
+  saving: boolean;
+  onSave: (columns: string[] | null) => void;
+}) {
+  const [selected, setSelected] = useState<Set<string>>(() => new Set(value ?? columns));
+  const [wasOpen, setWasOpen] = useState(false);
+  if (open && !wasOpen) {
+    setWasOpen(true);
+    setSelected(new Set(value ?? columns));
+  } else if (!open && wasOpen) setWasOpen(false);
+  const all = columns.every((c) => selected.has(c));
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent className="max-w-sm">
+        <DialogHeader>
+          <DialogTitle>Run in columns</DialogTitle>
+          <DialogDescription>Cells outside the chosen columns are skipped: no generation, no cost. Cells that reference a skipped cell are blocked.</DialogDescription>
+        </DialogHeader>
+        <div className="grid gap-1.5">
+          {columns.map((c) => (
+            <label key={c} className="flex cursor-pointer items-center gap-2 text-sm">
+              <input
+                type="checkbox"
+                checked={selected.has(c)}
+                onChange={(e) => {
+                  const next = new Set(selected);
+                  if (e.target.checked) next.add(c);
+                  else next.delete(c);
+                  setSelected(next);
+                }}
+              />
+              <span className="font-mono">{c}</span>
+            </label>
+          ))}
+        </div>
+        <DialogFooter>
+          <Button variant="ghost" size="sm" onClick={() => onOpenChange(false)}>
+            Cancel
+          </Button>
+          <Button size="sm" disabled={saving || selected.size === 0} onClick={() => onSave(all ? null : columns.filter((c) => selected.has(c)))}>
+            {all ? 'Run in every column' : `Run in ${selected.size} column${selected.size === 1 ? '' : 's'}`}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   );
 }

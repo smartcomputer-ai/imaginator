@@ -83,7 +83,7 @@ export function GridPage() {
               {rows.map((row, i) => (
                 <tr key={row.id}>
                   <td className="sticky left-0 z-10 border-b border-r bg-card p-0 align-top" style={{ minWidth: ROW_HEADER_WIDTH, width: ROW_HEADER_WIDTH }}>
-                    <RowHeader slug={slug} row={row} defaults={collection.defaults} index={i} total={rows.length} order={rowOrder} />
+                    <RowHeader slug={slug} row={row} defaults={collection.defaults} index={i} total={rows.length} order={rowOrder} columns={columnOrder} />
                   </td>
                   {columns.map((col) => (
                     <td key={col.id} className="border-b border-r p-1.5 align-top">

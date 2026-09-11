@@ -6,6 +6,7 @@ import { WithTooltip } from '@/components/ui/tooltip';
 export const STATUS_STYLE: Record<CellStatus, { variant: NonNullable<BadgeProps['variant']>; label: string; spin?: boolean }> = {
   missing: { variant: 'muted', label: 'pending' },
   blocked: { variant: 'muted', label: 'blocked' },
+  skipped: { variant: 'muted', label: 'skipped' },
   queued: { variant: 'blue', label: 'queued' },
   submitting: { variant: 'blue', label: 'submitting', spin: true },
   running: { variant: 'blue', label: 'running', spin: true },

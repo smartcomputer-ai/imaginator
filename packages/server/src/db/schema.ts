@@ -34,6 +34,12 @@ export const columns = sqliteTable(
     settings: text('settings', { mode: 'json' }).$type<JsonObject | null>(),
     count: integer('count').notNull().default(1),
     position: integer('position').notNull(),
+    /** Recipe: prompt template; null = '{prompt}'. */
+    prompt: text('prompt'),
+    /** Recipe: negative prompt template; null = '{negativePrompt}'. */
+    negativePrompt: text('negative_prompt'),
+    /** Recipe: replacement inputs; null = inherit the row's inputs. */
+    inputs: text('inputs', { mode: 'json' }).$type<Input[] | null>(),
   },
   (t) => [primaryKey({ columns: [t.collection, t.id] })],
 );
@@ -52,8 +58,51 @@ export const rows = sqliteTable(
     paused: integer('paused', { mode: 'boolean' }).notNull().default(false),
     position: integer('position').notNull(),
     notes: text('notes'),
+    /** Sparse row: run only in these columns; null = every column. */
+    columns: text('columns', { mode: 'json' }).$type<string[] | null>(),
   },
   (t) => [primaryKey({ columns: [t.collection, t.id] })],
+);
+
+/** A pinned generation per cell (DESIGN §3, Pins). Applies only while its hash matches the desired hash. */
+export const cellPins = sqliteTable(
+  'cell_pins',
+  {
+    collection: text('collection').notNull(),
+    row: text('row').notNull(),
+    column: text('column').notNull(),
+    generation: text('generation').notNull(),
+  },
+  (t) => [primaryKey({ columns: [t.collection, t.row, t.column] })],
+);
+
+/** An explicit cancellation hold: the desired hash is not recreated until retry/regenerate. */
+export const cellHolds = sqliteTable(
+  'cell_holds',
+  {
+    collection: text('collection').notNull(),
+    row: text('row').notNull(),
+    column: text('column').notNull(),
+    requestHash: text('request_hash').notNull(),
+  },
+  (t) => [primaryKey({ columns: [t.collection, t.row, t.column] })],
+);
+
+/**
+ * Reference index: every live input as written, by the row or column that
+ * carries it. `toRow`/`toColumn` are null for the relative anchor.
+ */
+export const refs = sqliteTable(
+  'refs',
+  {
+    fromCollection: text('from_collection').notNull(),
+    fromKind: text('from_kind').$type<'row' | 'column'>().notNull(),
+    fromId: text('from_id').notNull(),
+    toCollection: text('to_collection').notNull(),
+    toRow: text('to_row'),
+    toColumn: text('to_column'),
+  },
+  (t) => [index('refs_from_idx').on(t.fromCollection, t.fromKind, t.fromId), index('refs_to_idx').on(t.toCollection, t.toRow, t.toColumn)],
 );
 
 export const generations = sqliteTable(
@@ -107,7 +156,10 @@ export const assets = sqliteTable(
   (t) => [index('assets_sha256_idx').on(t.sha256), index('assets_created_idx').on(t.createdAt)],
 );
 
-export const schema = { collections, columns, rows, generations, assets };
+export const schema = { collections, columns, rows, generations, assets, cellPins, cellHolds, refs };
+export type CellPinRow = typeof cellPins.$inferSelect;
+export type CellHoldRow = typeof cellHolds.$inferSelect;
+export type RefRow = typeof refs.$inferSelect;
 export type CollectionRow = typeof collections.$inferSelect;
 export type ColumnRow = typeof columns.$inferSelect;
 export type RowRow = typeof rows.$inferSelect;

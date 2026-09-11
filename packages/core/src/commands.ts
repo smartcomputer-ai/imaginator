@@ -8,7 +8,8 @@ import {
   generationSchema,
   generationStatusSchema,
   generationTimingSchema,
-  inputsSchema,
+  columnInputsSchema,
+  rowInputsSchema,
   rowSchema,
 } from './domain.js';
 import {
@@ -16,6 +17,7 @@ import {
   cellAddressSchema,
   collectionSlugSchema,
   columnIdSchema,
+  generationIdSchema,
   generationRefSchema,
   modelIdSchema,
   rowIdSchema,
@@ -29,39 +31,78 @@ import { commonKeySchema, commonSettingsSchema, modelSettingsSchema } from './se
 
 export const cursorSchema = z.string().describe('Per-collection change cursor; opaque');
 
-export const CELL_STATUSES = [...generationStatusSchema.options, 'missing', 'blocked'] as const;
+export const CELL_STATUSES = [...generationStatusSchema.options, 'missing', 'blocked', 'skipped'] as const;
 export const cellStatusSchema = z.enum(CELL_STATUSES);
 export type CellStatus = (typeof CELL_STATUSES)[number];
+
+export const cellAttemptSchema = z.object({
+  generation: z.string(),
+  version: z.number().int(),
+  status: generationStatusSchema,
+  error: generationErrorSchema.optional(),
+  timing: generationTimingSchema,
+  cost: z.number().optional(),
+});
+export type CellAttempt = z.infer<typeof cellAttemptSchema>;
 
 export const cellViewSchema = z.object({
   row: rowIdSchema,
   column: columnIdSchema,
   address: z.string().describe('collection/row/column'),
-  hash: z.string().describe('Desired requestHash for this cell'),
+  hash: z.string().describe('Desired requestHash for this cell (a placeholder while blocked)'),
   /**
-   * `missing` = no generation yet for the desired hash (reconcile pending or
-   * paused). `blocked` = a row-reference input has no output yet; see `blocked`.
+   * The latest attempt's status for the desired hash, or `missing` (no attempt
+   * yet), `blocked` (a reference has no usable output; see `blocked`), or
+   * `skipped` (sparse row). A cell can be `failed` here and still have a
+   * `generation`: the previous success stays current.
    */
   status: cellStatusSchema,
   blocked: z.string().optional().describe('Why the cell cannot resolve yet, e.g. "waiting for r3"'),
-  generation: z.string().optional().describe('Current generation id'),
+  generation: z.string().optional().describe('Current successful generation id: what references and the grid use'),
   version: z.number().int().optional(),
+  latest: cellAttemptSchema.optional().describe('Newest non-cancelled attempt for the desired hash'),
   versions: z.number().int().describe('Non-cancelled generations in this cell, any hash'),
-  outputs: z.array(assetIdSchema),
+  outputs: z.array(assetIdSchema).describe('Current outputs, or a stale historical success when `stale` is set'),
   urls: z.array(z.string()),
   thumbnails: z.array(z.string()),
-  error: generationErrorSchema.optional(),
+  stale: z.boolean().optional().describe('Outputs come from an older success that no longer matches the content'),
+  pin: z.object({ generation: z.string(), version: z.number().int(), active: z.boolean() }).optional(),
+  hold: z.boolean().optional().describe('An explicit cancellation holds this cell until retry or regenerate'),
+  error: generationErrorSchema.optional().describe('Error of the latest attempt'),
   droppedKeys: z.array(commonKeySchema).optional(),
   timing: generationTimingSchema.optional(),
-  cost: z.number().optional().describe('Estimated USD of the current generation'),
+  cost: z.number().optional().describe('Estimated USD of the current (or latest) generation'),
 });
 export type CellView = z.infer<typeof cellViewSchema>;
+
+export const PROGRESS_STATES = ['running', 'blocked', 'settled'] as const;
+export const progressStateSchema = z.enum(PROGRESS_STATES);
+export type ProgressState = (typeof PROGRESS_STATES)[number];
+
+const cellIssueSchema = z.object({ cell: z.string(), message: z.string() });
+
+/** Dependency-aware progress of a collection (DESIGN §5). */
+export const progressSchema = z.object({
+  state: progressStateSchema,
+  allSucceeded: z.boolean().describe('settled with every included cell successful'),
+  pendingReconcile: z.boolean(),
+  upstream: z.object({ queued: z.number().int(), inFlight: z.number().int() }).describe('Active work in collections this one references'),
+  blocked: z.array(z.object({ cell: z.string(), reason: z.string(), pending: z.boolean() })),
+  attention: z.object({
+    failed: z.array(cellIssueSchema),
+    unsupported: z.array(cellIssueSchema),
+    needsAttention: z.array(cellIssueSchema),
+  }),
+  failedAttempts: z.array(cellIssueSchema).describe('Newer failed attempts on cells that still have a current success'),
+});
+export type Progress = z.infer<typeof progressSchema>;
 
 export const collectionViewSchema = collectionSchema.extend({
   cells: z.array(cellViewSchema),
   cursor: cursorSchema,
   inFlight: z.number().int().describe('Generations in submitting/running/downloading'),
   queued: z.number().int(),
+  progress: progressSchema,
 });
 export type CollectionView = z.infer<typeof collectionViewSchema>;
 
@@ -77,6 +118,7 @@ export const collectionSummarySchema = z.object({
   inFlight: z.number().int(),
   queued: z.number().int(),
   failed: z.number().int().describe('failed + unsupported + needs_attention'),
+  progress: progressStateSchema,
   cursor: cursorSchema,
   createdAt: z.string(),
   updatedAt: z.string(),
@@ -93,6 +135,7 @@ export const modelInfoSchema = z.object({
   capabilities: z.object({
     inputRoles: z.array(z.string()),
     maxInputImages: z.number().int(),
+    minInputImages: z.number().int().optional(),
     negativePrompt: z.boolean(),
     commonKeys: z.array(commonKeySchema),
     count: z.number().int(),
@@ -135,14 +178,18 @@ export const columnInputSchema = z.object({
   settings: modelSettingsSchema.optional(),
   count: z.number().int().min(1).optional(),
   position: z.number().int().min(0).optional(),
+  prompt: z.string().optional().describe('Recipe: prompt template, default "{prompt}"'),
+  negativePrompt: z.string().optional().describe('Recipe: negative prompt template, default "{negativePrompt}"; "" drops it'),
+  inputs: columnInputsSchema.optional().describe("Recipe: replaces the row's inputs; references here name a column (flux = same row's flux output)"),
 });
 export type ColumnInput = z.infer<typeof columnInputSchema>;
 
 export const rowInputSchema = z.object({
   prompt: z.string(),
   negativePrompt: z.string().optional(),
-  inputs: inputsSchema.optional(),
+  inputs: rowInputsSchema.optional(),
   settings: commonSettingsSchema.optional(),
+  columns: z.array(columnIdSchema).optional().describe('Sparse row: run only in these columns'),
   paused: z.boolean().optional(),
   notes: z.string().optional(),
   position: z.number().int().min(0).optional(),
@@ -160,8 +207,10 @@ export const collectionExportSchema = z.object({
   }),
   columns: z.array(columnSchema),
   rows: z.array(rowSchema),
-  /** Metadata of every asset referenced as a row input. */
+  /** Metadata of every asset referenced as a frozen input. */
   assets: z.array(assetSchema),
+  /** Other collections referenced by live inputs; they must exist on import. */
+  dependencies: z.array(collectionSlugSchema).optional(),
   exportedAt: z.string(),
 });
 export type CollectionExport = z.infer<typeof collectionExportSchema>;
@@ -302,7 +351,7 @@ export const commandDefs = {
     name: 'collections.wait',
     kind: 'read',
     description:
-      'Block until the collection cursor moves past the given one or the timeout elapses. Loop: mutate → wait(cursor) → get, while inFlight or queued > 0.',
+      'Block until the collection cursor moves past the given one (and pending reconciliation has run) or the timeout elapses. Loop: mutate → wait(cursor) → inspect, while progress.state is running.',
     input: z.object({
       collection: collectionArg,
       cursor: cursorSchema,
@@ -313,6 +362,7 @@ export const commandDefs = {
       changed: z.boolean(),
       inFlight: z.number().int(),
       queued: z.number().int(),
+      progress: progressSchema,
     }),
   }),
 
@@ -326,7 +376,7 @@ export const commandDefs = {
   'columns.update': def({
     name: 'columns.update',
     kind: 'write',
-    description: 'Update a column. `settings` replaces the whole bag when given; null clears it.',
+    description: 'Update a column. `settings` and the recipe fields replace wholesale when given; null clears them.',
     input: z.object({
       collection: collectionArg,
       column: columnIdSchema,
@@ -335,6 +385,9 @@ export const commandDefs = {
       settings: modelSettingsSchema.nullable().optional(),
       count: z.number().int().min(1).optional(),
       position: z.number().int().min(0).optional(),
+      prompt: z.string().nullable().optional().describe('Recipe: prompt template; null restores "{prompt}"'),
+      negativePrompt: z.string().nullable().optional().describe('Recipe: negative prompt template; null restores "{negativePrompt}"'),
+      inputs: columnInputsSchema.nullable().optional().describe("Recipe: replacement inputs; null inherits the row's inputs again"),
     }),
     output: z.object({ column: columnSchema, ...cursorOut }),
   }),
@@ -369,8 +422,9 @@ export const commandDefs = {
       row: rowIdSchema,
       prompt: z.string().optional(),
       negativePrompt: z.string().nullable().optional(),
-      inputs: inputsSchema.optional(),
+      inputs: rowInputsSchema.optional(),
       settings: commonSettingsSchema.nullable().optional(),
+      columns: z.array(columnIdSchema).nullable().optional().describe('Sparse row: run only in these columns; null = every column'),
       notes: z.string().nullable().optional(),
       position: z.number().int().min(0).optional(),
     }),
@@ -416,35 +470,77 @@ export const commandDefs = {
     name: 'cells.get',
     kind: 'read',
     images: true,
-    description: 'Get a cell: current generation and its version history.',
+    description: 'Get a cell: current success, latest attempt, version history, and the cells it reads from and feeds.',
     input: z.object({ cell: cellAddressSchema.describe('collection/row/column') }),
     output: z.object({
       cell: cellViewSchema,
-      current: generationSchema.optional(),
+      current: generationSchema.optional().describe('The current successful generation'),
+      latest: generationSchema.optional().describe('The latest attempt, when it is not the current one'),
       versions: z.array(generationSummarySchema),
+      precedents: z.array(z.string()).describe('Cell addresses this cell reads from'),
+      dependents: z.array(z.string()).describe('Cell addresses that read from this cell'),
       ...cursorOut,
     }),
   }),
   'cells.regenerate': def({
     name: 'cells.regenerate',
     kind: 'write',
-    description: '"Give me another one": queue a new generation of the same request (forced).',
-    input: z.object({ cell: cellAddressSchema.describe('collection/row/column') }),
+    description: '"Give me another one": queue a new generation of the same request (forced). holdCurrent pins the current success first so dependents do not move.',
+    input: z.object({ cell: cellAddressSchema.describe('collection/row/column'), holdCurrent: z.boolean().optional() }),
     output: z.object({ generation: generationSchema, ...cursorOut }),
   }),
   'cells.retry': def({
     name: 'cells.retry',
     kind: 'write',
-    description: 'Retry a failed, unsupported, or needs_attention cell with a fresh generation.',
+    description: 'Retry the latest failed, unsupported, or needs_attention attempt of a cell, or release an explicit cancellation hold.',
     input: z.object({ cell: cellAddressSchema.describe('collection/row/column') }),
     output: z.object({ generation: generationSchema, ...cursorOut }),
   }),
   'cells.cancel': def({
     name: 'cells.cancel',
     kind: 'write',
-    description: 'Cancel the in-flight generation of a cell, if any.',
+    description: 'Cancel the in-flight generation of a cell and hold it: the cancelled request is not recreated until retry or regenerate.',
     input: z.object({ cell: cellAddressSchema.describe('collection/row/column') }),
     output: z.object({ generation: generationSchema.optional(), ...cursorOut }),
+  }),
+  'cells.pin': def({
+    name: 'cells.pin',
+    kind: 'write',
+    description: 'Pin a successful generation as the cell\'s current version (default: the current success). Only a generation matching the desired hash can be pinned.',
+    input: z.object({
+      cell: cellAddressSchema.describe('collection/row/column'),
+      version: z.number().int().min(1).optional(),
+      generation: generationIdSchema.optional(),
+    }),
+    output: z.object({ cell: cellViewSchema, ...cursorOut }),
+  }),
+  'cells.unpin': def({
+    name: 'cells.unpin',
+    kind: 'write',
+    description: 'Remove the pin: the newest matching success becomes current again.',
+    input: z.object({ cell: cellAddressSchema.describe('collection/row/column') }),
+    output: z.object({ cell: cellViewSchema, ...cursorOut }),
+  }),
+  'cells.impact': def({
+    name: 'cells.impact',
+    kind: 'read',
+    description: 'Read-only preview of what a regenerate, retry, pin, or unpin on a cell could cascade into.',
+    input: z.object({
+      cell: cellAddressSchema.describe('collection/row/column'),
+      action: z.enum(['regenerate', 'retry', 'pin', 'unpin']).optional(),
+    }),
+    output: z.object({
+      cell: z.string(),
+      action: z.enum(['regenerate', 'retry', 'pin', 'unpin']),
+      cells: z.array(z.string()).describe('Potentially affected cells, transitive, excluding the source'),
+      collections: z.array(z.string()),
+      direct: z.number().int(),
+      transitive: z.number().int(),
+      sourcePinned: z.boolean().describe('An active pin on the source keeps dependents still while sampling'),
+      paused: z.object({ collections: z.array(z.string()), rows: z.array(z.string()) }),
+      pinned: z.array(z.string()).describe('Affected cells with an active pin (a pin does not stop changed inputs)'),
+      cursors: z.record(z.string(), cursorSchema),
+    }),
   }),
 
   'generations.get': def({

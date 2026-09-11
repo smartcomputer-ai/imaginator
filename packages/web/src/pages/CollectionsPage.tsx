@@ -4,6 +4,7 @@ import { slugify, type CollectionStatus } from '@imaginator/core';
 import { Plus, Trash2, Upload } from 'lucide-react';
 import { useEvents } from '@/api/events';
 import { useApi, useCollections, useCommand } from '@/api/queries';
+import { ProgressBadge } from '@/components/ProgressBadge';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog';
@@ -122,7 +123,10 @@ export function CollectionsPage() {
                   {c.rows} × {c.columns}
                 </td>
                 <td className="border-b px-2 py-1.5">
-                  <CellCounts succeeded={c.succeeded} inFlight={c.inFlight} queued={c.queued} failed={c.failed} total={c.cells} />
+                  <span className="inline-flex flex-wrap items-center gap-1">
+                    <CellCounts succeeded={c.succeeded} inFlight={c.inFlight} queued={c.queued} failed={c.failed} total={c.cells} />
+                    <ProgressBadge state={c.progress} />
+                  </span>
                 </td>
                 <td className="whitespace-nowrap border-b px-2 py-1.5 text-muted-foreground" title={c.updatedAt}>
                   {relativeTime(c.updatedAt)}

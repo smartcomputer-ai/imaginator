@@ -361,6 +361,15 @@ const img2img: ModelSpec = {
   },
 };
 
+/** An editing model like Kontext: takes an init image, no negative prompt. */
+const edit: ModelSpec = {
+  ...img2img,
+  id: 'mock/edit',
+  name: 'Mock Edit',
+  description: 'Like img2img but without negative prompt support: a stand-in for instruction-driven editors.',
+  capabilities: { ...img2img.capabilities, inputRoles: ['init', 'reference'], minInputImages: 1, negativePrompt: false },
+};
+
 // ---------------------------------------------------------------------------
 // Provider
 // ---------------------------------------------------------------------------
@@ -396,7 +405,7 @@ export const mockProvider: Provider = {
   id: 'mock',
   name: 'Mock',
   concurrency: 8,
-  models: [fast, slow, flaky, img2img, textOnlyOne],
+  models: [fast, slow, flaky, img2img, edit, textOnlyOne],
 
   async generate(req, ctx) {
     const spec = this.models.find((m) => m.id === req.model);
@@ -462,4 +471,4 @@ async function monitor(jobId: string, req: ResolvedRequest, spec: ModelSpec, ctx
   return result;
 }
 
-export const mockModels = { fast, slow, flaky, img2img, textOnly: textOnlyOne };
+export const mockModels = { fast, slow, flaky, img2img, edit, textOnly: textOnlyOne };
