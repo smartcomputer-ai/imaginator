@@ -7,6 +7,8 @@ import { CollectionsPage } from '@/pages/CollectionsPage';
 import { GridPage } from '@/pages/GridPage';
 import { CellPage } from '@/pages/CellPage';
 import { AssetsPage } from '@/pages/AssetsPage';
+import { LoginPage } from '@/pages/LoginPage';
+import { AuthGate } from '@/components/AuthGate';
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -23,15 +25,17 @@ export function App() {
     <QueryClientProvider client={queryClient}>
       <TooltipProvider delayDuration={300}>
         <BrowserRouter>
-          <Routes>
-            <Route element={<Layout />}>
-              <Route index element={<CollectionsPage />} />
-              <Route path="/c/:slug" element={<GridPage />} />
-              <Route path="/c/:slug/:row/:col" element={<CellPage />} />
-              <Route path="/assets" element={<AssetsPage />} />
-              <Route path="*" element={<Navigate to="/" replace />} />
-            </Route>
-          </Routes>
+          <AuthGate login={<LoginPage />}>
+            <Routes>
+              <Route element={<Layout />}>
+                <Route index element={<CollectionsPage />} />
+                <Route path="/c/:slug" element={<GridPage />} />
+                <Route path="/c/:slug/:row/:col" element={<CellPage />} />
+                <Route path="/assets" element={<AssetsPage />} />
+                <Route path="*" element={<Navigate to="/" replace />} />
+              </Route>
+            </Routes>
+          </AuthGate>
         </BrowserRouter>
         <Toaster position="bottom-right" richColors closeButton duration={5000} />
       </TooltipProvider>

@@ -60,7 +60,7 @@ export function createApp(overrides: ConfigOverrides = {}, deps: AppDeps = {}): 
   const commands = createCommandRegistry(services, registry);
   let baseUrl: string | undefined;
   const mcp = createMcpHttp({ commands, services, store, bus, version: SERVER_VERSION, baseUrl: () => baseUrl, log: config.log });
-  const http = createHttpApp({ commands, services, bus, store, mcp, webDist: path.join(REPO_ROOT, 'packages', 'web', 'dist'), log: config.log });
+  const http = createHttpApp({ commands, services, bus, store, mcp, webDist: path.join(REPO_ROOT, 'packages', 'web', 'dist'), auth: config.auth, log: config.log });
 
   let server: ServerType | undefined;
   let started = false;

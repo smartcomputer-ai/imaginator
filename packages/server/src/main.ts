@@ -9,6 +9,7 @@ const url = await app.listen();
 const providers = app.registry.listProviders().map((p) => `${p.id} (${p.models.length} models)`);
 app.config.log(`imaginator server listening on ${url}`);
 app.config.log(`data dir: ${app.config.dataDir}`);
+app.config.log(app.config.auth ? 'auth: enabled (web password + API key for MCP/scripts)' : 'auth: disabled (open localhost tool; set AUTH_ENABLED=1 to require a login)');
 app.config.log(`providers: ${providers.length ? providers.join(', ') : 'none'}; global concurrency ${app.config.globalConcurrency}`);
 
 let shuttingDown = false;

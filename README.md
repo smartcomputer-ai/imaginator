@@ -48,6 +48,31 @@ prompt: give it a few prompts and it sets up the grid, waits, and writes a
 comparison. Details, including what different MCP clients can and cannot do
 with images, are in `packages/server/README.md` and `docs/MCP-CLIENTS.md`.
 
+## Authenticated mode
+
+By default the server is an open localhost tool. To expose it, set in `.env`:
+
+```sh
+AUTH_ENABLED=1
+AUTH_PASSWORD=...        # web UI login
+AUTH_API_KEY=...         # MCP clients and scripts: Authorization: Bearer <key>
+IMAGINATOR_HOST=0.0.0.0  # optional: listen on all interfaces
+```
+
+The web app then shows a login page and keeps a session cookie (30 days,
+`AUTH_SESSION_DAYS` to change). MCP and `/api` calls need the bearer key:
+
+```sh
+claude mcp add --transport http imaginator http://host:4747/mcp --header "Authorization: Bearer $AUTH_API_KEY"
+curl -H "Authorization: Bearer $AUTH_API_KEY" http://host:4747/api/collections.list
+```
+
+The stdio bridge (`pnpm mcp`) picks `AUTH_API_KEY` up from the environment or
+`.env` on its own. Only `/api/health`, the login routes and the static web app
+stay open. Put TLS in front (a reverse proxy) when the host is not on a trusted
+network; the cookie is marked `Secure` when the request arrives over HTTPS or
+with `X-Forwarded-Proto: https`.
+
 ## How it works
 
 - **Nothing is imperative.** You never press "generate". Adding a row or a

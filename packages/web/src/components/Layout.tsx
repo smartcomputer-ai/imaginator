@@ -1,6 +1,10 @@
 import { NavLink, Outlet } from 'react-router';
-import { Images, LayoutGrid } from 'lucide-react';
+import { Images, LayoutGrid, LogOut } from 'lucide-react';
+import { toast } from 'sonner';
+import { logout, useAuthState } from '@/api/auth';
+import { errorMessage } from '@/api/client';
 import { useConnectionState } from '@/api/events';
+import { Button } from '@/components/ui/button';
 import { cn } from '@/lib/utils';
 import { WithTooltip } from '@/components/ui/tooltip';
 
@@ -15,6 +19,18 @@ function ConnectionDot() {
         <span className={cn('inline-block size-2 rounded-full', color)} />
         {state}
       </span>
+    </WithTooltip>
+  );
+}
+
+function LogoutButton() {
+  const auth = useAuthState();
+  if (auth.status !== 'ready' || !auth.enabled) return null;
+  return (
+    <WithTooltip label="Log out">
+      <Button variant="ghost" size="iconSm" aria-label="Log out" onClick={() => logout().catch((e: unknown) => toast.error(errorMessage(e)))}>
+        <LogOut />
+      </Button>
     </WithTooltip>
   );
 }
@@ -40,8 +56,9 @@ export function Layout() {
             <Images className="size-3.5" /> Assets
           </NavLink>
         </nav>
-        <div className="ml-auto">
+        <div className="ml-auto flex items-center gap-2">
           <ConnectionDot />
+          <LogoutButton />
         </div>
       </header>
       <main className="min-h-0 flex-1 overflow-auto">

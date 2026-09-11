@@ -12,6 +12,8 @@ import { ServiceError } from '../errors.js';
 import type { EventBus } from '../events/bus.js';
 import type { McpHttp } from '../mcp/http.js';
 import type { Services } from '../services/index.js';
+import type { AuthConfig } from '../config.js';
+import { createAuth, type Principal } from './auth.js';
 
 export interface HttpDeps {
   commands: CommandRegistry;
@@ -22,12 +24,16 @@ export interface HttpDeps {
   mcp?: McpHttp;
   /** Directory of the built web app; served statically when it exists. */
   webDist?: string;
+  /** Authenticated mode; undefined = open (localhost tool). */
+  auth?: AuthConfig;
   log: (m: string) => void;
 }
 
+type Env = { Variables: { principal?: Principal } };
+
 export interface HttpApp {
-  hono: Hono;
-  fetch: Hono['fetch'];
+  hono: Hono<Env>;
+  fetch: Hono<Env>['fetch'];
   /** Close every open SSE stream (shutdown). */
   closeStreams(): void;
 }
@@ -59,14 +65,67 @@ function queryToInput(query: Record<string, string>): Record<string, unknown> {
   return out;
 }
 
+const isSecure = (c: Context) => c.req.header('x-forwarded-proto') === 'https' || new URL(c.req.url).protocol === 'https:';
+
 export function createHttpApp(deps: HttpDeps): HttpApp {
-  const app = new Hono();
+  const app = new Hono<Env>();
   const streams = new Set<() => void>();
+  const auth = deps.auth ? createAuth(deps.auth) : undefined;
 
   app.use('*', cors({ origin: (origin) => origin || '*', credentials: false, exposeHeaders: ['Mcp-Session-Id', 'Mcp-Protocol-Version'], allowHeaders: ['Content-Type', 'Accept', 'Authorization', 'Mcp-Session-Id', 'Mcp-Protocol-Version', 'Last-Event-ID'] }));
   app.onError((e, c) => {
     if (!(e instanceof ServiceError)) deps.log(`http error ${c.req.method} ${c.req.path}: ${e.stack ?? e.message}`);
     return errorResponse(c, e);
+  });
+
+  // -- auth -------------------------------------------------------------------------
+  // Everything under /api, /assets and /mcp needs a credential in authenticated
+  // mode: the session cookie (web login) or `Authorization: Bearer <AUTH_API_KEY>`
+  // (MCP clients, scripts). Health, the auth routes and the static web app stay open.
+  if (auth) {
+    app.use('*', async (c, next) => {
+      const { pathname } = new URL(c.req.url);
+      const guarded = pathname.startsWith('/api/') || pathname === '/api' || pathname.startsWith('/assets/') || pathname === '/mcp';
+      const open = pathname === '/api/health' || pathname.startsWith('/api/auth/') || c.req.method === 'OPTIONS';
+      if (!guarded || open) return next();
+      const principal = auth.authenticate(c.req.raw);
+      if (!principal) {
+        const headers = { 'WWW-Authenticate': 'Bearer realm="imaginator"' };
+        if (pathname === '/mcp') {
+          return c.json({ jsonrpc: '2.0', error: { code: -32001, message: 'Unauthorized: send `Authorization: Bearer <AUTH_API_KEY>`' }, id: null }, 401, headers);
+        }
+        return c.json({ error: { message: 'authentication required', code: 'unauthorized' } }, 401, headers);
+      }
+      c.set('principal', principal);
+      return next();
+    });
+  }
+
+  app.get('/api/auth/status', (c) => {
+    if (!auth) return c.json({ enabled: false, authenticated: true });
+    const principal = auth.authenticate(c.req.raw);
+    return c.json({ enabled: true, authenticated: !!principal, ...(principal ? { via: principal } : {}) });
+  });
+
+  app.post('/api/auth/login', async (c) => {
+    if (!auth) return c.json({ ok: true, enabled: false });
+    const body = (await c.req.json().catch(() => ({}))) as { password?: unknown };
+    const password = typeof body.password === 'string' ? body.password : '';
+    if (!auth.checkPassword(password)) {
+      const delay = auth.loginFailed();
+      deps.log(`auth: failed login (next attempt delayed ${delay}ms)`);
+      await new Promise((r) => setTimeout(r, delay));
+      throw new ServiceError('unauthorized', 'wrong password');
+    }
+    auth.loginSucceeded();
+    const { token, exp } = auth.issueSession();
+    c.header('Set-Cookie', auth.sessionCookie(token, exp, isSecure(c)));
+    return c.json({ ok: true, enabled: true, expiresAt: new Date(exp).toISOString() });
+  });
+
+  app.post('/api/auth/logout', (c) => {
+    if (auth) c.header('Set-Cookie', auth.clearCookie(isSecure(c)));
+    return c.json({ ok: true });
   });
 
   app.get('/api/health', (c) => c.json({ ok: true, bootId: deps.bus.bootId }));
@@ -93,8 +152,14 @@ export function createHttpApp(deps: HttpDeps): HttpApp {
     });
     return c.json({
       commands,
+      auth: auth
+        ? 'enabled: send `Authorization: Bearer <AUTH_API_KEY>` (MCP, scripts) or log in with POST /api/auth/login { password } for a session cookie (web)'
+        : 'disabled',
       other: {
         'GET /api/health': 'liveness + bootId',
+        'GET /api/auth/status': '{ enabled, authenticated, via? }',
+        'POST /api/auth/login { password }': 'sets the session cookie (authenticated mode)',
+        'POST /api/auth/logout': 'clears the session cookie',
         'GET /api/events?collection=<slug>': 'server-sent events: hello, then ImaginatorEvent per line',
         'POST|GET|DELETE /mcp': 'MCP over Streamable HTTP (tools, resources, prompts)',
         'POST /api/assets.upload (multipart/form-data: file, label?)': 'file upload alternative to the JSON form',

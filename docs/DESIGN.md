@@ -1094,6 +1094,13 @@ on SSE events.
 per-provider `{ apiKey, concurrency }`. A provider is enabled when its key is
 present. The model registry is code; adding a model is adding a `ModelSpec`.
 
+Auth is optional and transport-level, not a domain concept: `AUTH_ENABLED=1`
+requires a password login for the web (stateless HMAC session cookie) and a
+bearer API key (`AUTH_API_KEY`) for MCP and `/api` clients. It is one
+middleware in front of the command routes, assets, SSE and `/mcp`; commands,
+services and the engine know nothing about it. Off by default because the
+tool is single-user on localhost.
+
 ---
 
 ## 9. What is deliberately left for later
@@ -1130,7 +1137,8 @@ present. The model registry is code; adding a model is adding a `ModelSpec`.
   generation history, selected versions, and asset files. The initial
   collection export declares external references and requires them to exist
   on import.
-- Auth. Localhost tool.
+- Multi-user auth (accounts, per-user data). The single password + API key
+  mode (§8) is for exposing one person's instance, not for sharing it.
 
 ---
 

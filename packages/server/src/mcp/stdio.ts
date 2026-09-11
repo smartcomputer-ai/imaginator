@@ -8,6 +8,9 @@
  * never interprets the messages.
  *
  *   IMAGINATOR_SERVER_URL=http://127.0.0.1:4747 pnpm mcp
+ *
+ * When the server runs in authenticated mode, AUTH_API_KEY (from the env or
+ * the repo's .env) is sent as `Authorization: Bearer ...` on every request.
  */
 import { StdioServerTransport } from '@modelcontextprotocol/server/stdio';
 import { StreamableHTTPClientTransport, type JSONRPCMessage } from '@modelcontextprotocol/client';
@@ -27,7 +30,8 @@ if (!health?.ok) {
   process.exit(1);
 }
 
-const upstream = new StreamableHTTPClientTransport(endpoint);
+const apiKey = process.env.AUTH_API_KEY;
+const upstream = new StreamableHTTPClientTransport(endpoint, apiKey ? { requestInit: { headers: { Authorization: `Bearer ${apiKey}` } } } : undefined);
 const local = new StdioServerTransport();
 
 let closing = false;

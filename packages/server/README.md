@@ -23,6 +23,16 @@ Config comes from env (`.env` at the repo root is loaded by `main.ts`):
 when no real key is present. `createApp(overrides)` in `src/app.ts` boots the
 same thing programmatically (tests use it with a temp data dir).
 
+`AUTH_ENABLED=1` turns on authenticated mode (`AUTH_PASSWORD` for the web
+login, `AUTH_API_KEY` as bearer token for MCP and scripts; both required). The
+middleware in `src/http/app.ts` guards `/api/*`, `/assets/*` and `/mcp`;
+`src/http/auth.ts` holds the stateless HMAC session cookie
+(`imaginator_session`, `HttpOnly; SameSite=Lax`) and the constant-time
+comparisons. Routes: `GET /api/auth/status`, `POST /api/auth/login { password }`,
+`POST /api/auth/logout`. Unauthenticated requests get 401 with
+`{ error: { code: 'unauthorized' } }` (a JSON-RPC error on `/mcp`) and a
+`WWW-Authenticate: Bearer` header.
+
 ## Cost estimates
 
 No provider returns a price, so every generation's `cost` is an estimate made
@@ -162,7 +172,8 @@ claude mcp add imaginator -- pnpm --dir /path/to/imaginator mcp
 
 The bridge (`pnpm mcp`) reads `IMAGINATOR_SERVER_URL` (default
 `http://127.0.0.1:$IMAGINATOR_PORT`) and exits with a message if no server is
-listening there.
+listening there. In authenticated mode it sends `AUTH_API_KEY` (env or `.env`)
+as a bearer token.
 
 **Tools** are the agent surface and deliberately not one-per-command. UI-only
 operations (reorder, rename, duplicate, import/export, labels, gc) stay

@@ -1,4 +1,5 @@
 import { commandDefs, type CommandInput, type CommandName, type CommandOutput } from '@imaginator/core';
+import { markUnauthenticated } from './auth';
 
 export interface ApiErrorBody {
   message: string;
@@ -49,6 +50,7 @@ export async function call<N extends CommandName>(name: N, input: CommandInput<N
   }
 
   if (!res.ok) {
+    if (res.status === 401) markUnauthenticated();
     const body = (json as { error?: ApiErrorBody } | undefined)?.error;
     throw new ApiError(res.status, body ?? { message: res.statusText || `HTTP ${res.status}`, code: 'http' });
   }

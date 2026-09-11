@@ -1,4 +1,4 @@
-export type ErrorCode = 'validation' | 'not_found' | 'conflict' | 'storage' | 'internal';
+export type ErrorCode = 'validation' | 'not_found' | 'conflict' | 'storage' | 'internal' | 'unauthorized';
 
 const STATUS: Record<ErrorCode, number> = {
   validation: 400,
@@ -6,6 +6,7 @@ const STATUS: Record<ErrorCode, number> = {
   conflict: 409,
   storage: 500,
   internal: 500,
+  unauthorized: 401,
 };
 
 export class ServiceError extends Error {
