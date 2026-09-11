@@ -122,8 +122,14 @@ Everything below is built so that the simple reading,
    and a new instruction, not a conversation transcript or provider session.
 3. "Use as input" can drop a frozen asset or a live reference into a row,
    optionally naming a column or another collection.
-4. A column recipe can add inputs, rewrite the prompt, and override common
-   settings, which turns the column into a pipeline stage.
+4. A column recipe can replace the inputs and rewrite the prompt, which
+   turns the column into a pipeline stage.
+
+The rule of thumb for everything that follows: **a row is for this subject,
+a column is for every subject.** If something applies to every subject but
+needs per-subject material beyond the previous stage's output, it is a row
+for now. The table at the end of "Column recipes" maps use cases to
+features.
 
 ### Collection
 ```ts
@@ -148,9 +154,8 @@ Everything below is built so that the simple reading,
   count: number,                     // outputs per cell; capped by the model
   position: number,
   prompt?: string,                   // template; default '{prompt}'
-  inputs?: (Input | { rowInputs: true })[],   // default [{ rowInputs: true }]
-  common?: CommonSettingsOverride,   // per-key override; null removes an inherited key
-  negativePrompt?: string | null,    // absent inherits the row; null removes it
+  negativePrompt?: string,           // template; default '{negativePrompt}'; '' drops it
+  inputs?: Input[],                  // absent = inherit the row's inputs; present = replace them
 }
 ```
 
@@ -159,10 +164,9 @@ capped by the model's `capabilities.count`). It lives on the column, not the
 row, because it is part of what the column *is*: a column asking for four
 samples is a different experiment from one asking for one.
 
-`prompt`, `inputs`, `common`, and `negativePrompt` are the column's
-**recipe**: how it builds a cell out of the row. All inherit the row by
-default, so a column with no recipe is simply a model. See "Column recipes"
-below.
+`prompt`, `negativePrompt`, and `inputs` are the column's **recipe**: how
+it builds a cell out of the row. All inherit the row by default, so a column
+with no recipe is simply a model. See "Column recipes" below.
 
 ### Row
 ```ts
@@ -264,7 +268,8 @@ the same.
 ### Column recipes
 
 A column is a model plus a recipe for turning the row into a request. The
-recipe inherits the row by default:
+recipe inherits the row by default, and it is deliberately small: two
+templates and one inherit-or-replace list.
 
 - **`prompt`** is a template. `{prompt}` is the row's prompt, and the default
   template is `{prompt}`. A style column might use `{prompt}, woodcut print,
@@ -272,28 +277,26 @@ recipe inherits the row by default:
   description, so a film-grain stage might use `add heavy 35mm film grain,
   keep composition and subject` with no placeholder at all. Whether a
   refining column sees the row's prompt is the column's decision.
-- **`inputs`** is an ordered list whose default is one entry, the placeholder
-  `{ rowInputs: true }`: the row's inputs, at that position. A column can add
-  frozen assets around it, `[row inputs, style.png as reference]`, meaning
-  "this model, always with this style reference". A stage column drops the
-  placeholder: `[{ column: 'flux', role: 'init' }]` means the cell takes the
+- **`negativePrompt`** is a template with the same rules. `{negativePrompt}`
+  is the row's negative prompt and the default. A stage sets it to the empty
+  string to drop it. This matters more than it looks: a negative prompt is
+  never silently dropped, so a base row's "no text, no watermark" would turn
+  every stage cell whose model takes no negative prompt into `unsupported`.
+  The stage says it does not want one, in one field, with no null semantics.
+- **`inputs`**, when absent, inherits the row's inputs unchanged. When
+  present, it replaces them wholesale with the list as authored: column
+  references, absolute references, and frozen assets, indexed as written.
+  A stage column is `[{ column: 'flux', role: 'init' }]`: the cell takes the
   same row's Flux output and *not* the row's inputs, because those already
-  went into Flux. Making the placeholder explicit, rather than always
-  appending column inputs to row inputs, is what lets follow-up rows and
-  stage columns coexist without two `init` images colliding.
-- **`common`** overrides the row's effective common settings per key. For
-  example, an upscale column can set a larger `size`, while a crop stage
-  can replace `aspectRatio`. A null value removes an inherited key.
-- **`negativePrompt`** inherits when absent, replaces the row's value when
-  a string, and removes it when null. A later stage need not inherit a
-  negative prompt intended only for the base generator.
+  went into Flux. Replacing rather than appending is what lets follow-up
+  rows and stage columns coexist without two `init` images colliding.
 
-A row's `maskFor` indices count within the row's inputs and are shifted by
-the number of inputs before the placeholder when the recipe is expanded.
-At most one row-inputs placeholder is allowed. Column-authored `maskFor`
-indices name an explicit init entry in the column recipe, not an entry
-inside the placeholder; expansion remaps those indices too. Validation of
-the final list checks the resulting targets and roles.
+There is no mixing of the row's inputs into a column-authored list, so no
+placeholder and no mask-index remapping: every `maskFor` counts within the
+list it was written in. A stage that needs the row's mask or reference
+image *and* the previous stage's output is a row for now (see the table
+below). Common settings are not part of the recipe; a stage that needs a
+different size uses the model's own settings when it has them, or is a row.
 
 Reading a row left to right across stage columns is a pipeline. With
 columns `flux`, `film` (Kontext, recipe `[flux → init]`, an instruction
@@ -310,35 +313,45 @@ r2  ↳r1   flux(edits   film(r2/flux)    upscale(r2/film)  unsupported
 Flux makes the image, Kontext adds grain to it, the upscaler finishes it,
 and the baseline cell is an unrelated comparison. Row r2 is a follow-up on
 r1 written the ordinary way: in `flux` it edits r1's Flux image; in `film`
-the recipe ignores the row's reference and takes r2/flux, the edited base,
-so the grain stage re-applies to the edit. "Stage" is not a concept the
-engine knows. A stage is a column whose recipe references another column,
-and it waits, runs, and reruns like any cell.
+the recipe replaces the row's reference with r2/flux, the edited base, so
+the grain stage re-applies to the edit. "Stage" is not a concept the engine
+knows. A stage is a column whose recipe references another column, and it
+waits, runs, and reruns like any cell.
+
+**Which feature for which job.** A row is for this subject; a column is for
+every subject.
+
+| You want | Use |
+|---|---|
+| Compare models on the same prompt | Plain columns. |
+| Edit an image again, one chain per model | Follow-up row, `r3`. |
+| Edit again, but only in one model | Follow-up row plus sparse `columns`. |
+| The same edit applied to one chosen base by every model | Row with `r1/flux`. |
+| The same stage applied to every subject, row by row | Column recipe: `inputs: [flux → init]` plus a prompt template. |
+| Two stagers compared on the same base, for every subject | Two stage columns over the same source column. |
+| A stage that also needs the row's mask or reference image | A row per subject. Mixed input composition is deferred. |
+| A stage that needs a different size or aspect ratio | Model settings on the column if the model exposes them; otherwise a row. Common overrides are deferred. |
+| One model over several other models' outputs | A second collection with full-address references. |
+| A one-off experiment on one image | A row. |
+| A base you like, kept while sampling more | A pin. |
 
 ### Settings
 Two disjoint vocabularies:
 
 - **CommonSettings** (`aspectRatio`, `size`, `seed`, `outputFormat`): a
-  small shared vocabulary, supported selectively by models. Collection
-  defaults fill gaps in the row; the column recipe may then override or
-  remove individual keys. Resolution, with the rightmost value winning:
-  `collection.defaults` ← `row.settings` ← `column.common`.
+  small shared vocabulary, supported selectively by models. Owned by the
+  **row**; collection defaults fill gaps. Resolution: `collection.defaults`
+  ← `row.settings`. Every column of a row, stage or not, receives the same
+  effective common settings, subject to what its model honors.
 - **ModelSettings** (`quality`, `style`, `guidance`, `steps`, ...):
   provider-specific knobs declared by the model's zod schema. Owned by the
   **column**; the model's registry defaults fill gaps. Rows cannot set them.
 
-`CommonSettingsOverride` has the same optional keys as `CommonSettings`,
-each also accepting null. Null deletes the inherited key before validation
-and hashing; it is not sent to the provider. Omission inherits. A recipe
-changing aspect ratio must also replace or remove any conflicting inherited
-size; neither key silently wins over the other.
-
-Every cell in a column runs the same model configuration and the same
-recipe. Plain comparison columns inherit the row settings unchanged; a
-stage's overrides are shown in its header/editor and resolved request.
-Validation rejects model keys in row settings or `column.common`, and
-common keys in `column.settings`. Common overrides belong to the recipe,
-not to individual cells.
+The split is what keeps columns comparable: every cell in a column runs the
+same model configuration and the same recipe, and a row can vary what goes
+in but never quietly change what a column means. Validation rejects a row
+setting a model key or a column setting a common key. A column-level
+override of common settings is deliberately not part of the recipe (§9).
 
 Each model declares which common keys it honors. An unsupported common key
 is dropped at resolution time and the drop is recorded on the generation so
@@ -479,20 +492,22 @@ new work.
 `content()` is:
 
 - the column's model ID, its `settings` as written, and its `count`;
-- the rendered prompt and the negative prompt after recipe overrides;
-- the ordered inputs after the column recipe is expanded, with roles and
-  mask targets, where every reference is replaced by the asset ID of the
-  source cell's current output;
-- common settings after collection defaults, row settings, and column
-  overrides, with null removals applied and unhonored keys removed.
+- the rendered prompt and the rendered negative prompt;
+- the ordered inputs after the column recipe is applied (the row's list,
+  or the column's replacement list), with roles and mask targets, where
+  every reference is replaced by the asset ID of the source cell's current
+  output;
+- the row's common settings after applying collection defaults, with keys
+  the model does not honor removed.
 
 Registry defaults, dropped-key records, the registry version, and anything
 else `resolve()` adds on the way to the provider are **not** hashed. They
 are recorded in the generation's `request` snapshot instead. The distinction
 is what makes the identity stable: upgrading the server or changing a
 model's default `steps` must never invalidate every cell. User edits that
-change effective content do change the hash; edits hidden by recipe
-overrides do not. Removing unhonored keys before hashing means changing a
+change effective content do change the hash; edits a recipe does not use
+(a row's inputs under a replacing column, a row's prompt under a literal
+template) do not. Removing unhonored keys before hashing means changing a
 seed on a model that ignores seeds also leaves its hash unchanged.
 
 Templates and references are hashed by what they *resolve to*, never as
@@ -1035,7 +1050,7 @@ Routes:
   thumbnails (a reference shows as an address chip, `↳ r3`), settings
   popover, pause toggle, "add follow-up row". Column header = model,
   settings popover, and a `← flux` marker when the column's recipe
-  references another column, plus explicit common-setting overrides.
+  references another column.
   Cell = current image with attempt progress/error, or a stale historical
   image with the missing/blocked reason, or an empty/skipped cell. Pins and
   execution holds are visible; click for detail. Collection header =
@@ -1055,10 +1070,10 @@ The features layer so the basics stay untouched. Rows are prompts and
 columns are models; nothing else is visible until asked for. "Follow up" on
 a cell is the first reference anyone meets. "Use as input" is where absolute
 and cross-collection references appear, next to the frozen asset. The
-column editor keeps the recipe in a collapsed section showing `{prompt}` and
-a single "row inputs" chip, inherited common settings, and an inherited
-negative prompt. Adding a column reference makes a stage. Overrides become
-visible once set; ordinary comparison columns keep the simple editor. Pause
+column editor keeps the recipe in a collapsed section showing `{prompt}`,
+`{negativePrompt}`, and "inputs: inherited from the row". Switching inputs
+to a list and adding a column reference makes a stage. Ordinary comparison
+columns keep the simple editor. Pause
 is labeled as stopping new submissions, and a pin as holding the selected
 output, so those controls do not imply the same effect.
 
@@ -1088,6 +1103,10 @@ present. The model registry is code; adding a model is adding a `ModelSpec`.
 - Cost estimates, accounting beyond the per-generation number, and hard
   execution budgets. Dependency footprints and sampling controls ship with
   references rather than waiting for accurate pricing.
+- Recipe extensions, each deferred until a real stage needs it: mixing the
+  row's inputs into a column-authored list (a placeholder plus mask-index
+  remapping), and column-level overrides of common settings such as an
+  upscale stage requesting a larger size. Until then, both are rows.
 - "Paste values": turn a reference into the asset it currently resolves to.
 - Dependency highlighting in the grid (precedents and dependents on hover).
 - Multi-process runner (lease column, see §4.2).
@@ -1129,11 +1148,11 @@ present. The model registry is code; adding a model is adding a `ModelSpec`.
    expose dependency-aware progress, and ship cascade previews and controls
    for the existing same-column chains.
 8. **Same-collection recipes and references.** Column anchors on row
-   references, partial-address parsing, and column recipes with prompt/input
-   expansion, common overrides, and negative-prompt inheritance. Maintain the
+   references, partial-address parsing, and column recipes: prompt and
+   negative-prompt templates, inherit-or-replace inputs. Maintain the
    reference index and effective cell graph, validate cycles and deletion,
-   and extend impact previews to stages. Add the recipe editor, stage and
-   override markers, and precedent/dependent links.
+   and extend impact previews to stages. Add the recipe editor, stage
+   markers, and precedent/dependent links.
 9. **Cross-collection references.** Full addresses, a workbook resolver,
    transitive invalidation using old/new edges, dependent collection cursors
    and SSE, and waiting across prerequisites. Add cross-collection cycle
@@ -1209,11 +1228,13 @@ SQLite file and the controllable mock provider:
   ignores the row's inputs; a follow-up row under a stage column re-applies
   the stage to the edited base; a template and a literal that render the
   same text share a hash; editing a template reruns only that column and
-  its dependents; common overrides follow precedence and null removal;
-  conflicting inherited size/aspect ratio is rejected without approximation;
-  negative-prompt removal reaches the request; row and column mask targets
-  remap correctly; adding a column or changing a sparse row/recipe cannot
-  introduce a cycle through previously inactive references.
+  its dependents; a replacing column ignores row input edits (no rerun)
+  while an inheriting column reruns; an empty negative-prompt template keeps
+  a stage supported on a model without negative prompts while the row's
+  negative prompt still reaches the base column; a column-authored list is
+  validated as written, mask targets included; adding a column or changing
+  a sparse row/recipe cannot introduce a cycle through previously inactive
+  references.
 - Cascade previews: effective dependencies exclude discarded row inputs;
   affected collections and paused scopes are shown; source hold-current
   sampling has no selection cascade; a dependent pin invalidated by changed
