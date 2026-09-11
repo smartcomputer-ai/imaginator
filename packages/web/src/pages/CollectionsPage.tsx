@@ -1,5 +1,5 @@
-import { useEffect, useRef, useState } from 'react';
-import { Link, useNavigate } from 'react-router';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { Link, useLocation, useNavigate } from 'react-router';
 import { slugify, type CollectionStatus } from '@imaginator/core';
 import { Plus, Trash2, Upload } from 'lucide-react';
 import { useEvents } from '@/api/events';
@@ -24,6 +24,45 @@ export function CollectionsPage() {
   const [createOpen, setCreateOpen] = useState(false);
   const remove = useCommand('collections.delete');
   const importRef = useRef<HTMLInputElement>(null);
+  const location = useLocation();
+
+  // Selection, kept in the fragment (`/#moonbase`) so a grid's Escape lands back on its row.
+  const slugs = useMemo(() => (data?.collections ?? []).map((c) => c.slug), [data]);
+  const selected = useMemo(() => {
+    const s = decodeURIComponent(location.hash.replace(/^#/, ''));
+    return slugs.includes(s) ? s : undefined;
+  }, [location.hash, slugs]);
+  const select = (slug: string | undefined) => navigate({ hash: slug ? `#${slug}` : '' }, { replace: true });
+
+  useEffect(() => {
+    if (selected) document.getElementById(`collection-${selected}`)?.scrollIntoView({ block: 'nearest' });
+  }, [selected]);
+
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.defaultPrevented || e.altKey || e.ctrlKey || e.metaKey || e.shiftKey) return;
+      const t = e.target as HTMLElement | null;
+      if (t && (t.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(t.tagName) || t.closest('[role="dialog"], [role="menu"], [role="listbox"]'))) return;
+      if (slugs.length === 0) return;
+      if (e.key === 'Escape' && selected) {
+        e.preventDefault();
+        select(undefined);
+        return;
+      }
+      if (!['ArrowUp', 'ArrowDown', 'Enter', ' '].includes(e.key)) return;
+      e.preventDefault();
+      if (!selected) {
+        select(slugs[0]);
+        return;
+      }
+      const i = slugs.indexOf(selected);
+      if (e.key === 'ArrowDown') select(slugs[Math.min(slugs.length - 1, i + 1)]);
+      else if (e.key === 'ArrowUp') select(slugs[Math.max(0, i - 1)]);
+      else navigate(`/c/${selected}`);
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [selected, slugs, navigate]);
 
   const onImport = async (file: File) => {
     let document: unknown;
@@ -88,7 +127,7 @@ export function CollectionsPage() {
               <th className="w-full max-w-0 border-b px-2 py-1.5 font-medium">Title</th>
               <th className="whitespace-nowrap border-b px-2 py-1.5 font-medium">Status</th>
               <th className="whitespace-nowrap border-b px-2 py-1.5 font-medium text-right">Grid</th>
-              <th className="whitespace-nowrap border-b px-2 py-1.5 font-medium">Cells</th>
+              <th className="whitespace-nowrap border-b px-2 py-1.5 text-right font-medium">Cells</th>
               <th className="whitespace-nowrap border-b px-2 py-1.5 font-medium">Updated</th>
               <th className="border-b px-2 py-1.5" />
             </tr>
@@ -97,16 +136,18 @@ export function CollectionsPage() {
             {collections.map((c) => (
               <tr
                 key={c.slug}
-                className="group cursor-pointer hover:bg-accent/40 focus-visible:bg-accent/40 focus-visible:outline-none"
+                id={`collection-${c.slug}`}
+                className={`group cursor-pointer hover:bg-accent/40 focus-visible:outline-none ${selected === c.slug ? 'bg-accent/50 ring-2 ring-inset ring-ring' : ''}`}
                 tabIndex={0}
+                aria-selected={selected === c.slug}
+                onFocus={() => {
+                  if (selected !== c.slug) select(c.slug);
+                }}
                 onClick={(e) => {
                   // Links and buttons inside the row keep their own behaviour.
                   if ((e.target as HTMLElement).closest('a, button')) return;
                   if (e.metaKey || e.ctrlKey) window.open(`/c/${c.slug}`, '_blank');
                   else navigate(`/c/${c.slug}`);
-                }}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter' && e.target === e.currentTarget) navigate(`/c/${c.slug}`);
                 }}
               >
                 <td className="w-full max-w-0 border-b px-2 py-1.5">
@@ -114,7 +155,11 @@ export function CollectionsPage() {
                     {c.title || c.slug}
                   </Link>
                   <span className="ml-2 font-mono text-[11px] text-muted-foreground">{c.slug}</span>
-                  {c.description && <div className="whitespace-pre-wrap break-words text-xs text-muted-foreground">{c.description}</div>}
+                  {c.description && (
+                    <WithTooltip label={<div className="max-w-md whitespace-pre-wrap">{c.description}</div>}>
+                      <div className="line-clamp-3 whitespace-pre-wrap break-words text-xs text-muted-foreground">{c.description}</div>
+                    </WithTooltip>
+                  )}
                 </td>
                 <td className="border-b px-2 py-1.5">
                   <Badge variant={c.status === 'live' ? 'green' : 'muted'}>{c.status}</Badge>
@@ -122,8 +167,8 @@ export function CollectionsPage() {
                 <td className="whitespace-nowrap border-b px-2 py-1.5 text-right tabular-nums text-muted-foreground">
                   {c.rows} × {c.columns}
                 </td>
-                <td className="border-b px-2 py-1.5">
-                  <span className="inline-flex flex-wrap items-center gap-1">
+                <td className="whitespace-nowrap border-b px-2 py-1.5 text-right">
+                  <span className="inline-flex items-center justify-end gap-1">
                     <CellCounts succeeded={c.succeeded} inFlight={c.inFlight} queued={c.queued} failed={c.failed} total={c.cells} />
                     <ProgressBadge state={c.progress} />
                   </span>
@@ -172,7 +217,7 @@ export function CellCounts({
   total?: number;
 }) {
   return (
-    <span className="inline-flex flex-wrap items-center gap-1 tabular-nums">
+    <span className="inline-flex items-center gap-1 whitespace-nowrap tabular-nums">
       <WithTooltip label="succeeded">
         <Badge variant="green">{succeeded}</Badge>
       </WithTooltip>

@@ -42,7 +42,7 @@ export function GridPage() {
   const { slug = '' } = useParams();
   const location = useLocation();
   const navigate = useNavigate();
-  useEscapeTo('/');
+  useEscapeTo(`/#${slug}`);
   const scrollRef = useScrollMemory<HTMLDivElement>(`grid:${slug}`);
   useEvents(slug);
   const { data: collection, isLoading, error } = useCollection(slug);
