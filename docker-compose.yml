@@ -1,0 +1,36 @@
+services:
+  imaginator:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    image: imaginator-dev:latest
+    container_name: imaginator
+    restart: always              # <- brings the app back when the VM boots
+    env_file: .env
+    environment:
+      IMAGINATOR_PORT: "8080"
+      IMAGINATOR_HOST: "0.0.0.0"
+      IMAGINATOR_DATA_DIR: "/app/data"
+      CHOKIDAR_USEPOLLING: "1"   # reliable file watching across the bind mount
+    ports:
+      - "8080:8080"
+    volumes:
+      # live source: edit on the host, the server reloads itself
+      - ./:/app
+      # node_modules stay container-side (native modules: better-sqlite3, sharp)
+      - imaginator_node_modules:/app/node_modules
+      - imaginator_nm_core:/app/packages/core/node_modules
+      - imaginator_nm_server:/app/packages/server/node_modules
+      - imaginator_nm_web:/app/packages/web/node_modules
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8080/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 180s
+
+volumes:
+  imaginator_node_modules:
+  imaginator_nm_core:
+  imaginator_nm_server:
+  imaginator_nm_web:
